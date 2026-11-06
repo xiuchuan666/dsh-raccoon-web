@@ -1,0 +1,7 @@
+packages:
+  - 'packages/*'
+
+# esbuild 是 tsup 的底层打包器，安装时需要一个安装后脚本下载/校验平台二进制。
+# 不批准的话 pnpm 会以 ERR_PNPM_IGNORED_BUILDS 结束，tsup 跑不起来。
+onlyBuiltDependencies:
+  - esbuild

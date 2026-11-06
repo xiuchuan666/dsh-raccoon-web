@@ -1,0 +1,67 @@
+{
+  "name": "dsh-raccoon-web",
+  "version": "0.1.0",
+  "description": "把商汤小浣熊（Raccoon）网页网关接进 DSH 作为 LLM provider —— 微信扫码登录，不依赖桌面端凭据。",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "raccoon",
+    "xiaohuanxiong",
+    "llm-provider"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "tsup && node ../../scripts/copy-client.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types \"test/**/*.test.ts\""
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.2.1-rc.1 <0.2.2-0 || >=0.2.2-rc.1 <0.2.3-0 || >=0.2.3-rc.1 <0.2.4-0 || >=0.2.4-rc.1 <0.2.5-0 || >=0.2.5-rc.1 <0.2.6-0 || >=0.2.6-rc.1 <0.2.7-0 || >=0.2.7-rc.1 <0.2.8-0 || >=0.2.8-rc.1 <0.2.9-0 || >=0.2.9-rc.1 <0.3.0-0",
+    "@earendil-works/pi-ai": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,24 @@
+node_modules/
+lib/
+dist/
+*.tsbuildinfo
+*.log
+
+# 别人的包，只读参考，不进版本库
+research/pkgs/
+research/captures/
+research/*.json
+
+# 打包产物
+*.tgz
+packages/*/dsh-*-*.tgz
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本地临时
+.tmp/
+*.local

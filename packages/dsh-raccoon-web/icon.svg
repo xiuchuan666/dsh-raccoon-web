@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="小浣熊">
+  <defs>
+    <linearGradient id="fur" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8d99a6"/>
+      <stop offset="100%" stop-color="#5b6873"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#1f2933"/>
+  <g>
+    <path d="M14 22 L9 10 L24 17 Z" fill="url(#fur)"/>
+    <path d="M50 22 L55 10 L40 17 Z" fill="url(#fur)"/>
+    <path d="M14 22 L11.5 14 L21 18 Z" fill="#d9e0e6"/>
+    <path d="M50 22 L52.5 14 L43 18 Z" fill="#d9e0e6"/>
+    <ellipse cx="32" cy="36" rx="20" ry="18" fill="url(#fur)"/>
+    <path d="M32 20 Q22 30 22 34 Q22 40 32 40 Q42 40 42 34 Q42 30 32 20 Z" fill="#2a343d" opacity="0.85"/>
+    <ellipse cx="24" cy="31" rx="4.6" ry="4.2" fill="#f2f5f7"/>
+    <ellipse cx="40" cy="31" rx="4.6" ry="4.2" fill="#f2f5f7"/>
+    <circle cx="24.6" cy="31.4" r="2.3" fill="#101820"/>
+    <circle cx="40.6" cy="31.4" r="2.3" fill="#101820"/>
+    <circle cx="25.4" cy="30.5" r="0.9" fill="#ffffff" opacity="0.9"/>
+    <circle cx="41.4" cy="30.5" r="0.9" fill="#ffffff" opacity="0.9"/>
+    <ellipse cx="32" cy="41" rx="4.4" ry="3.2" fill="#101820"/>
+    <ellipse cx="32" cy="40" rx="2.1" ry="1.4" fill="#3a464f"/>
+    <path d="M32 43.5 Q32 47 27.5 47.5" stroke="#101820" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+    <path d="M32 43.5 Q32 47 36.5 47.5" stroke="#101820" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+  </g>
+</svg>

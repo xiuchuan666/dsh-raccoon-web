@@ -1,0 +1,29 @@
+{
+  "name": "dsh-raccoon-web-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Workspace for dsh-raccoon-web — a DSH plugin that reverse-proxies SenseTime Raccoon (商汤小浣熊) web gateway into DSH as an LLM provider.",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "probe": "node scripts/probe-gateway.mjs",
+    "probe:qr": "node scripts/probe-gateway.mjs --qr",
+    "link": "node scripts/link.mjs",
+    "unlink": "node scripts/unlink.mjs --remove",
+    "revive": "node scripts/revive.mjs",
+    "verify": "node scripts/verify-install.mjs",
+    "log": "node scripts/devlog.mjs",
+    "smoke": "node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scripts/smoke-host.mjs && node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scripts/smoke-provider.mjs",
+    "smoke:live": "node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scripts/smoke-desktop-auth.mjs",
+    "smoke:chat": "node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scripts/smoke-chat-live.mjs",
+    "build": "pnpm --filter dsh-raccoon-web run build",
+    "typecheck": "pnpm --filter dsh-raccoon-web run typecheck",
+    "test": "node --experimental-strip-types --import ./scripts/test-resolve-register.mjs --test \"packages/dsh-raccoon-web/test/*.test.ts\""
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.3"
+  }
+}
