@@ -103,6 +103,44 @@ check("files 字段包含必要产物", async () => {
   return missing.length ? bad(`缺 ${missing.join(", ")}`) : ok(files.join(", "));
 });
 
+check("src/build.ts 的 VERSION 与 package.json 一致", async () => {
+  // 这两个值是**手写**的（见 src/build.ts 注释：ESM 读 package.json 要 import assertion，
+  // tsup 打包时会变成奇怪代码）。手写就会漂，所以必须有机器检查。
+  // 2026-11-11 真实漂过一次：package.json 升 0.2.0，build.ts 还是 0.1.0，
+  // 宿主 status 端点报 0.1.0，看起来像"新版本没装上去"。
+  if (!pkg?.version) return bad("package.json 没有 version，先修上一条");
+  let text;
+  try {
+    text = await readFile(join(PKG_DIR, "src", "build.ts"), "utf8");
+  } catch (e) {
+    return bad(`读不到 src/build.ts: ${e.message}`);
+  }
+  const m = /export\s+const\s+VERSION\s*=\s*"([^"]*)"/.exec(text);
+  if (!m) return bad('src/build.ts 里找不到 `export const VERSION = "..."`');
+  if (m[1] !== pkg.version) {
+    return bad(`build.ts 是 ${m[1]}，package.json 是 ${pkg.version} —— 改一处不算改完`);
+  }
+  return ok(`${m[1]}（两处一致）`);
+});
+
+check("lib/index.js 里的 VERSION 与 package.json 一致（产物是否重新构建）", async () => {
+  // 上一条查源码，这一条查**产物**。源码对了但忘了重新构建，宿主跑的还是旧版本。
+  if (!pkg?.version) return bad("package.json 没有 version");
+  let text;
+  try {
+    text = await readFile(join(PKG_DIR, "lib", "index.js"), "utf8");
+  } catch (e) {
+    return bad(`读不到 lib/index.js: ${e.message}`);
+  }
+  // tsup 会把它内联成 `var VERSION = "0.2.0";` 或 `const VERSION = "0.2.0";`
+  const m = /(?:var|const|let)\s+VERSION\s*=\s*"([^"]*)"/.exec(text);
+  if (!m) return bad("lib/index.js 里找不到内联的 VERSION");
+  if (m[1] !== pkg.version) {
+    return bad(`产物里是 ${m[1]}，package.json 是 ${pkg.version} —— 忘了重新构建`);
+  }
+  return ok(`${m[1]}（产物已更新）`);
+});
+
 check("engines 与宿主一致", async () => {
   const e = pkg?.engines?.node;
   if (!e) return bad("缺 engines.node");
@@ -157,6 +195,30 @@ check("client.js 有 BUILD 标记（用于确认缓存）", async () => {
   if (!hasBuild) return bad("缺 const BUILD =");
   if (!hasGlobal) return bad("缺 globalThis.__DSH_BUILD_raccoon");
   return ok("BUILD 标记齐全");
+});
+
+check("client.js 的 BUILD 与 src/build.ts 一致（两处手写，最容易漂）", async () => {
+  // 这两个 BUILD 是排查"改了界面没变化"的唯一判据（docs/04-ops/01-troubleshooting.md §2）：
+  // 宿主 status 里的 build 与浏览器 console 里的 __DSH_BUILD_raccoon 对不上，
+  // 就说明浏览器加载的是缓存的旧 client.js。所以两边必须同源。
+  const cp = [join(PKG_DIR, "client.js"), join(PKG_DIR, "lib", "client.js")].find(exists);
+  if (!cp) return bad("client.js 不存在");
+  let srcText;
+  try {
+    srcText = await readFile(join(PKG_DIR, "src", "build.ts"), "utf8");
+  } catch (e) {
+    return bad(`读不到 src/build.ts: ${e.message}`);
+  }
+  const hostBuild = /export\s+const\s+BUILD\s*=\s*"([^"]*)"/.exec(srcText);
+  if (!hostBuild) return bad("src/build.ts 里找不到 `export const BUILD = \"...\"`");
+  const clientText = await readFile(cp, "utf8");
+  // client.js 是手写的 classic script，用单引号；src/build.ts 用双引号。两种都要认。
+  const clientBuild = /(?:const|var|let)\s+BUILD\s*=\s*['"]([^'"]*)['"]/.exec(clientText);
+  if (!clientBuild) return bad("client.js 里找不到 BUILD 字面量");
+  if (clientBuild[1] !== hostBuild[1]) {
+    return bad(`client.js 是 ${clientBuild[1]}，src/build.ts 是 ${hostBuild[1]} —— 改 client.js 要同步两处`);
+  }
+  return ok(`${hostBuild[1]}（两处一致）`);
 });
 
 check("client.js 无 console.log（应用 logger 或 console.warn/error）", async () => {

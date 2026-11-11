@@ -19,6 +19,7 @@
 
 import type { LoginPhase } from "./login-flow.js";
 import type { PublishState } from "./publish.js";
+import type { PoolState } from "./pool.js";
 
 /** 一个模型的展示信息。 */
 export interface StatusModel {
@@ -55,6 +56,15 @@ export interface StatusLogin {
   /** epoch ms。 */
   deadline?: number;
   message?: string;
+  /**
+   * 这张二维码/这一轮登录是给谁用的：`primary` = 换当前账号，
+   * `pool` = 往号池加一个成员。
+   *
+   * 设置卡的「登录」区与「账号池」区都各自有扫码按钮，共用同一个
+   * `LoginFlow`。两个区都必须用 `mode` 认领"这张码是不是我的"，
+   * 否则一边点按钮会让另一边的二维码显示成"还在等你扫"。
+   */
+  mode?: "primary" | "pool";
   /** JWT 的 sub 前 8 位。够区分账号，不够反推。 */
   principal?: string;
   /** token 类型。 */
@@ -83,6 +93,64 @@ export interface StatusDesktopAuth {
   reason?: string;
 }
 
+/**
+ * 号池里的一个账号。
+ *
+ * **不含 token**（同 §三条硬规则第 1 条）。设备身份只给前 8 位：
+ * 它的用途是"用户能看出两个号不是同一个环境"，不是让用户拿去复刻。
+ */
+export interface StatusPoolAccount {
+  /** `sha256(principal).slice(0,16)`。UI 用它做 key。 */
+  id: string;
+  /** 用户起的名字，没有就显示 principal 前 8 位。 */
+  label?: string;
+  /** JWT sub 前 8 位。 */
+  principal: string;
+  /** epoch ms。 */
+  expiresAt?: number;
+  /** epoch ms。 */
+  addedAt: number;
+  /** 是否参与自动换号。 */
+  enabled: boolean;
+  /**
+   * `x-client-device-id` 去掉 `raccoon-` 前缀后的前 8 位十六进制。
+   *
+   * **不带前缀**：早期版本用 `slice(0, 8)` 把 `raccoon-` 整个吃掉了，
+   * 界面上显示成 `设备 raccoon-`，看起来像"设备标识是空的"。
+   */
+  device: string;
+  /** 这个号从哪来。 */
+  source: "qr" | "desktop";
+  /** 最近一次测量的结论。没测过就是 undefined。 */
+  measure?: {
+    state: PoolState;
+    /** epoch ms。 */
+    at: number;
+    /** 冷却到期时间，epoch ms。`dead` 时是 `Number.MAX_SAFE_INTEGER`。 */
+    until?: number;
+    note?: string;
+  };
+  /** 当前是不是这个号在服务。 */
+  active: boolean;
+}
+
+/** 号池整体状态。 */
+export interface StatusPool {
+  /** 总开关。关掉时仍可签到/测试（ADR-0010 §5）。 */
+  enabled: boolean;
+  /** 是否已有账号（哪怕一个都没启用）。 */
+  ready: boolean;
+  /** 池里账号总数。 */
+  total: number;
+  /** 其中启用的数量。 */
+  enabledCount: number;
+  /** 当前在服务的账号 id。关掉号池时为 undefined。 */
+  activeId?: string;
+  accounts: StatusPoolAccount[];
+  /** 池为空 / 全死 / 全部冷却 时的说明，给人看。 */
+  note?: string;
+}
+
 /** 完整快照。 */
 export interface StatusSnapshot {
   /** client.js 的构建标记。诊断时第一眼看的东西。 */
@@ -107,9 +175,13 @@ export interface StatusSnapshot {
     debugLog: boolean;
     authSource: "auto" | "desktop" | "qr";
     qrProtocol: "web" | "iam";
+    /** 号池总开关（ADR-0010）。 */
+    poolEnabled: boolean;
   };
   /** 桌面端凭据探测结果。**不含 token。** */
   desktopAuth: StatusDesktopAuth;
+  /** 号池状态。**不含 token。** */
+  pool: StatusPool;
   /** 诊断块里可复制的纯文本。**不含 token。** */
   diagnostics: string;
 }
@@ -144,6 +216,18 @@ export function buildDiagnostics(input: {
     `上下文上限: ${snapshot.settings.contextCap}`,
     `思考: ${snapshot.settings.reasoning ? "开" : "关"}`,
     `扫码协议: ${snapshot.settings.qrProtocol === "web" ? "Web auth（官方桌面端同款）" : "IAM 小程序码"}`,
+    `号池: ${poolLine(snapshot.pool)}`,
   ];
   return lines.join("\n");
+}
+
+/** 诊断块里的号池一行。 */
+function poolLine(pool: StatusPool): string {
+  if (!pool.enabled) {
+    return pool.total === 0 ? "关（池空）" : `关（${pool.total} 个账号，未启用自动换号）`;
+  }
+  if (pool.total === 0) return "开（池空）";
+  if (pool.enabledCount === 0) return `开（${pool.total} 个账号，0 个启用）`;
+  const active = pool.activeId === undefined ? "-" : pool.activeId.slice(0, 8);
+  return `开（${pool.enabledCount} 个启用，当前 ${active}）`;
 }

@@ -23,7 +23,15 @@ export type RaccoonErrorKind =
 
 /** 每种 kind 的用户可见文案。`hint` 必须是可执行动作。 */
 export const HINTS: Record<RaccoonErrorKind, string> = {
-  AUTH: "小浣熊登录已失效，请在设置 → 插件 → 小浣熊 里重新扫码。",
+  /**
+   * 两种登录来源都写在一条文案里，因为这一层（协议层）**不知道**当前用的是哪种：
+   * `fetchCatalog` / `chatStream` 只拿到 token 字符串。
+   *
+   * 2026-11-11 之前这里只写"重新扫码" —— 对**只读官方客户端凭据**的用户是错的引导
+   * （他从来没扫过码，该做的是打开客户端让它自己续）。分来源的精确文案在
+   * `src/host/index.ts` 的 `refreshCatalog()` 里，那一层知道 `token.source`。
+   */
+  AUTH: "小浣熊登录已失效。如果用的是官方客户端账号，打开官方客户端重新登录即可；如果是扫码登录的，在设置 → 插件 → 小浣熊 里重新扫码。",
   RATE_LIMIT:
     "小浣熊账号的模型吞吐已达上限（不是每分钟请求数，而是按账号的 token 速率）。" +
     "一轮对话带的上下文越大越快撞到，撞到后额度按吞吐缓慢回血，上游也没有给恢复时间。" +
@@ -34,6 +42,62 @@ export const HINTS: Record<RaccoonErrorKind, string> = {
   INVALID_REQUEST: "这次请求小浣熊不接受。通常是请求体太大或参数不被支持。",
   ABORTED: "",
 };
+
+/**
+ * 请求体上限（E-019 实测）。
+ *
+ * 2026-11-11 用纯文本填充逐字节逼近：**3,145,600 字节收下，3,145,700 字节拒收**，
+ * 多次重跑稳定 → 阈值约 3.0001 MiB（不是整 3 MiB，更不是早期猜的 10 MB）。
+ *
+ * 两个必须记住的反直觉点：
+ *   ① 超限**不返回 413**，返回 `400 inference request is invalid`。按 413 做分支是死代码。
+ *   ② 这个 message 与"参数非法"共用，**只能靠 message 区分**，不能靠状态码。
+ */
+export const BODY_LIMIT_BYTES = 3_145_650;
+
+/** 体积超限的判定关键词（E-019）。 */
+const OVERSIZE_WORDS = ["inference request is invalid"];
+
+/** 图片相关失败的关键词（E-018）。 */
+const IMAGE_WORDS = ["image download failed", "invalid image base64 content"];
+
+/**
+ * 这个响应体是不是"体积超限"。
+ *
+ * 注意这是**启发式**：`inference request is invalid` 也可能来自参数错误。
+ * 所以调用方只在 `status === 400` 且本地已经算出请求体接近 `BODY_LIMIT_BYTES` 时才该信它；
+ * 只有 message 命中时退化成"可能是体积问题"，文案里会同时给参数检查的提示。
+ */
+export function isOversizeError(text: string): boolean {
+  const lower = text.toLowerCase();
+  return OVERSIZE_WORDS.some((w) => lower.includes(w));
+}
+
+/** 这个响应体是不是"图片下载/解码失败"（E-018）。 */
+export function isImageError(text: string): boolean {
+  const lower = text.toLowerCase();
+  return IMAGE_WORDS.some((w) => lower.includes(w));
+}
+
+/**
+ * 体积超限的用户文案。
+ *
+ * 必须写清"是体积不是上下文长度"—— `inference request is invalid` 听起来像参数写错了，
+ * 用户会去翻设置；实际是图片/上下文加起来太大。同时给出两条可执行动作。
+ */
+export const OVERSIZE_HINT =
+  "请求体超过了上游约 3 MiB 的上限（不是上下文 token 超长，是发送的字节数超了）。" +
+  "减少一次带的图片数量或尺寸，或新建一个会话把上下文清短，再发一次。";
+
+/**
+ * 图片下载失败的用户文案。
+ *
+ * E-018 实测：`image download failed` 是**服务端去下载那个 URL 失败**，
+ * 不是"不支持 URL"、也不是"不支持识图"。不写清这一点，用户会以为插件不支持图片。
+ */
+export const IMAGE_DOWNLOAD_HINT =
+  "小浣熊的服务器没能下载到这张图。如果图片是网页链接，多半是它的服务器连不上那个站点 —— " +
+  "把图片保存到本地再作为附件发送就能通过。如果图片是粘贴/上传的，检查它是否完整。";
 
 /**
  * 协议层唯一抛出的错误类型。

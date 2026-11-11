@@ -17,7 +17,7 @@
  */
 
 /** 插件版本。必须与 packages/dsh-raccoon-web/package.json 的 version 一致。 */
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 
 /** 构建标记。改 client.js 时同步改。 */
-export const BUILD = "2026-11-06T15:35";
+export const BUILD = "2026-11-11T23:05";

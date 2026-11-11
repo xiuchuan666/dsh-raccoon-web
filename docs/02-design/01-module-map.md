@@ -7,51 +7,53 @@
 
 ---
 
-## 1. 实测行数（2026-11-06）
+## 1. 实测行数（2026-11-11）
 
 ```
-packages/dsh-raccoon-web/
-├── src/                                    5862 行
+packages/dsh-raccoon-web/                  实测 2026-11-11（逐文件数行）
+├── src/                                    7,370 行 / 28 文件
 │   ├── build.ts                              23
 │   ├── index.ts                             125   插件入口
 │   ├── types/
 │   │   └── dsh.d.ts                         148   内核类型桩（内核没有 .d.ts）
-│   ├── protocol/                           2550
-│   │   ├── consts.ts                        100
-│   │   ├── errors.ts                        143
-│   │   ├── headers.ts                       106
-│   │   ├── qr.ts                            484   ← 最大单文件
+│   ├── protocol/                           2,748
+│   │   ├── consts.ts                        138
+│   │   ├── errors.ts                        207
+│   │   ├── headers.ts                       120
+│   │   ├── qr.ts                            484   ← protocol 里最大
 │   │   ├── iam.ts                           323
 │   │   ├── web-auth.ts                      178
 │   │   ├── desktop-auth.ts                  203
-│   │   ├── catalog.ts                       323
-│   │   ├── chat.ts                         470
-│   │   └── points.ts                        170
-│   ├── provider/                            593
-│   │   ├── api.ts                           104
-│   │   ├── roster.ts                        163
-│   │   ├── adapter.ts                       258
+│   │   ├── catalog.ts                       331
+│   │   ├── chat.ts                          505   ← 最大单文件（protocol）
+│   │   └── points.ts                        267
+│   ├── provider/                            669
+│   │   ├── api.ts                           134
+│   │   ├── roster.ts                        176
+│   │   ├── adapter.ts                       298
 │   │   └── fallback-roster.ts                68
-│   └── host/                               2198
-│       ├── index.ts                        742   ← 最大单文件
-│       ├── routes.ts                        237
-│       ├── login-flow.ts                    386
-│       ├── publish.ts                       222
-│       ├── store.ts                         223
-│       ├── settings.ts                      207
-│       ├── status.ts                        149
-│       ├── cache.ts                          75
+│   └── host/                              3,735
+│       ├── index.ts                       1,280   ← 最大单文件
+│       ├── pool.ts                          439
+│       ├── login-flow.ts                    448
+│       ├── routes.ts                        240
+│       ├── publish.ts                       244
+│       ├── store.ts                         230
+│       ├── status.ts                        233
+│       ├── settings.ts                      221
+│       ├── solid-png.ts                     126
 │       ├── log.ts                           106
-│       └── solid-png.ts                     126
-├── client.js                               1127   手写 classic script
-└── test/                                   2042
+│       └── cache.ts                          75
+├── client.js                              1,525   手写 classic script
+└── test/                                  2,644 行 / 11 文件
     ├── helpers.ts                           170
     ├── qr.test.ts                           166
     ├── iam.test.ts                          297
     ├── web-auth.test.ts                     198
     ├── catalog.test.ts                      246
-    ├── chat.test.ts                          324
-    ├── host.test.ts                         416
+    ├── chat.test.ts                         415
+    ├── host.test.ts                         522
+    ├── pool.test.ts                         405
     └── stubs/{dsh-llm,dsh-llm-pi-ai,pi-ai}.ts  68/40/117
 ```
 
@@ -61,7 +63,7 @@ packages/dsh-raccoon-web/
 
 **白名单**：`node:*`、相对路径。**黑名单**：任何 `@deepseek-ai/*`、`@earendil-works/*`。
 
-### consts.ts（100 行）
+### consts.ts（138 行）
 
 唯一允许出现 URL / 超时 / 版本号的地方。
 
@@ -96,7 +98,7 @@ export const DEFAULT_CONTEXT_CAP = 128_000;
 
 **为什么 `CORDIS_ID` 与 `PROVIDER_ID` 不同**：前者是 cordis 树节点 id，后者是 LLM provider 名。用户改 `cordis.patch.yml` 时看到的是前者。
 
-### errors.ts（143 行）
+### errors.ts（199 行）
 
 ```ts
 export type RaccoonErrorKind =
@@ -126,7 +128,7 @@ export function toRaccoonError(err: unknown, fallback?: RaccoonErrorKind): Racco
 
 **`RATE_LIMIT_CODES` 里必须有 200429**：上游限流有时是 `HTTP 200 + {"code":200429,"message":"user_model_rate_limited"}`，只看 `status === 429` 会让用户看到"模型突然不说话"。
 
-### headers.ts（106 行）
+### headers.ts（120 行）
 
 ```ts
 export function clientPlatform(): "desktop-windows" | "desktop-macos" | "desktop-linux";
@@ -237,7 +239,7 @@ export function desktopAuthExpired(auth: DesktopAuth, now?: number): boolean;   
 
 **边界**：只读、不上传、读不到就明说。不扫全盘、不读浏览器 cookie、不碰凭据管理器、不 attach 内存。
 
-### catalog.ts（323 行）
+### catalog.ts（331 行）
 
 ```ts
 export interface RaccoonModel {
@@ -266,7 +268,7 @@ export function flattenCatalog(groups): RaccoonModel[];
 
 **响应体绝不截断**（CAT-3 单测：200 个模型 > 4096 字符，最后一个必须完整）。
 
-### chat.ts（470 行）
+### chat.ts（505 行）
 
 ```ts
 export interface RaccoonFrame {
@@ -304,7 +306,7 @@ export function chatStream(token, body, onFrame, options?): Promise<void>;
 
 **`sessionIdFor(principal, model)`** = `sess-0-<sha256(principal + "\0" + model).hex.slice(0,8)>`。只在 chat 请求带 `x-raccoon-session-id`。理由：官方客户端 26 分钟 125 次调用都用同一个会话 id，每次新建会让网关看到"一个账号几分钟开了几百个会话"。
 
-### points.ts（170 行）
+### points.ts（267 行）
 
 ```ts
 export interface RaccoonBalance { available?, permanent?, daily?, raw }
@@ -326,7 +328,7 @@ export function todayGranted(bills: RaccoonBill[], now?: number): boolean;
 
 **白名单**：上面 + `@earendil-works/pi-ai`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-llm-pi-ai`。
 
-### api.ts（104 行）
+### api.ts（134 行）
 
 ```ts
 export function createRaccoonApi(effortOf?: (model: unknown) => string | undefined): {
@@ -337,7 +339,7 @@ export function createRaccoonApi(effortOf?: (model: unknown) => string | undefin
 
 68 行实质逻辑 + 36 行注释。做的事只有一件：**在 `onPayload` 里调 `applyThinking()`**。SSE / 思考 / 工具 / usage 全交还 pi-ai（[ADR-0007](./adr/0007-wrap-openai-completions-api.md)）。
 
-### roster.ts（163 行）
+### roster.ts（176 行）
 
 ```ts
 export const LLM_CHAT_URL = `${LLM_BASE}/chat/completions`;   // 仅供 probe / 测试断言
@@ -379,7 +381,7 @@ export function toDescriptors(models, options): ModelDescriptor[];
 
 `baseUrl` 那个坑：`pi-ai` 的 `createClient()` 把 `model.baseUrl` 原样交给 `new OpenAI({ baseURL })`，SDK 在 `chat.completions.create()` 里自己拼 `/chat/completions`。写全路径会变成 `.../llm/v2/chat/completions/chat/completions` → 404（E-023）。
 
-### adapter.ts（258 行）
+### adapter.ts（291 行）
 
 ```ts
 export function assembleAdapter(options: AdapterOptions): { adapter: unknown; providerIds: string[] }
@@ -420,7 +422,7 @@ Qwen3.8-Flash         —     x0.15   262144 / 32768
 
 ## 4. `host/` —— 唯一接触 `ctx` 的层
 
-### index.ts（742 行，最大的单文件）
+### index.ts（1,280 行，最大的单文件）
 
 `class RaccoonHost`。一眼看清的字段：
 
@@ -436,26 +438,50 @@ loginFlow: LoginFlow;
 publisher: Publisher;
 catalogCache: TtlCache<CatalogState>;
 quotaCache: TtlCache<QuotaState>;
+accounts: PoolAccount[];                // 号池成员（含明文 token，只在内存与 accounts.json）
+poolQuota: Map<string, PoolQuota>;      // 每个池成员最近一次读到的余额
+poolActiveId: string | undefined;       // 当前"粘住"的号
 ```
 
 方法：
 
 | 方法 | 做什么 |
 | --- | --- |
-| `bootstrap()` | 读 token → 读 probes → `resolveToken()` → `syncPublisher()` → 有 token 则 `refreshCatalog()` + `refreshQuota()` + 再 sync |
+| `bootstrap()` | 读 token → 读 probes → 读号池 → `resolveToken()` → `syncPublisher()` → 有 token 则 `refreshCatalog()` + `refreshQuota()` + 再 sync |
 | `resolveToken(reason)` | 按 `authSource` 决定用桌面端还是扫码；过期/读不到时的降级与文案 |
 | `mount(webServer)` | 挂 status / action 两条路由，返回 disposer |
-| `runAction(action, body)` | 八个 action 的分派 |
-| `snapshot()` | 组装 `StatusSnapshot`（含 13 行诊断） |
-| `syncPublisher()` | 名册签名变了才重新发布 |
+| `runAction(action, body)` | 全部 action 的分派：16 个 `case`、14 个 action 名（`set-setting` 与 `set-enabled` 同体） |
+| `snapshot()` | 组装 `StatusSnapshot`（含 14 行诊断） |
+| `syncPublisher()` | 名册每次重建（设备身份是名册级属性），签名没变时 publisher 自己跳过 |
 | `statusModels()` | 按 `contextCap` 截断后给 UI 的模型列表 |
+| `selectPoolAccount()` | **纯函数**，算出"该用哪个号"，不写状态 |
+| `peekPoolAccount()` | 只读入口，`snapshot()` / `displayToken()` 用 |
+| `resolvePoolAccount()` | 会写 `poolActiveId` 并打 `pool/pick`，只有真要发请求的路径用 |
+| `displayToken()` | 设置卡「账号」那行的来源：池成员在服务就报池成员，否则退回 `this.token` |
 | `dispose()` | 幂等，释放 routes / adapter / 定时器 |
 
 **为什么 `bootstrap()` 要在 `refreshCatalog` 之后补 `refreshQuota()`**：早先在 `snapshot()` 里 `void refreshQuota()` 火后不管，用户第一次打开设置卡看到"余额未知"，要等 20s 轮询才出现。桌面端路线启动时就有 token，没有理由让首屏空着。
 
 **为什么 `statusModels()` 也要按 `contextCap` 截断**：与 `roster.ts` 的 `toDescriptor` 用同一套算法。否则设置卡显示"1M 上下文"，实际发 128000，用户以为截断没生效。
 
-### routes.ts（237 行）
+**为什么"选号"要拆成三个方法**：`snapshot()` 每 20 秒被前端轮询一次，而 `resolvePoolAccount()` 会写 `poolActiveId` 并打日志。只读路径带副作用是分层错误。拆开后 `selectPoolAccount()` 是唯一的实现，`peekPoolAccount()` 与 `resolvePoolAccount()` 都调它 —— 所以界面显示的当前号与真正在发请求的号**永远一致，不是靠两处代码写得像，是靠只有一个实现**。
+
+**预热判据必须是 `activeToken()` 而不是 `this.token`**：装过官方客户端、只用「导入客户端账号」加池、从没扫码的用户，`this.token` 是 `undefined` 而号池里明明有好号。四处判据（`bootstrap()` 预热 / `refresh-catalog` / `refreshAuth` / `probeVision`）在 2026-11-11 之前都用错了。
+
+### pool.ts（439 行）
+
+号池的**纯逻辑**，不碰 `ctx`、不碰网络（只碰文件）。分成四块：
+
+| 块 | 导出 | 关键点 |
+| --- | --- | --- |
+| 身份 | `poolAccountId(principal)` / `newDeviceId()` | id 是 `sha256(principal).slice(0,16)` —— **派生值，夹具不能手编**；deviceId 是 `raccoon-` + 32 hex |
+| 排序 | `sortForUse(accounts, quota, now)` | 五条规则，②`daily` 降序在③`available` 降序**之前**（workbuddy issue #70 教训） |
+| 分类 | `classifyMeasure({status, bodyText?, now})` / `isCooling()` / `shouldPersistMeasure()` | 400 与流中断**不记**；连续 `ok` **不重复落盘** |
+| 落盘 | `readPool()` / `writePool()` / `upsertAccount()` / `poolFile()` / `poolSummary()` | 整表原子写、`0600`、坏行只丢那一行 |
+
+`shouldPersistMeasure()` 单独存在是因为它有一个反直觉的规则：**`ok` 之后又是 `ok` 就不写**。`recordMeasure()` 挂在 `onResponse` 上，每轮对话都会执行，而 `writePool()` 是整表原子写（含明文 token）—— 不拦的话等于每说一句话就把所有账号的 token 往磁盘刷一次。规则抽成纯函数才能单测（PO-36~PO-40）。
+
+### routes.ts（240 行）
 
 ```
 STATUS_PATH = "/plugins/dsh-raccoon-web/status"     （GET，幂等）
@@ -473,7 +499,7 @@ ACTION_PATH = "/plugins/dsh-raccoon-web/action"     （POST only，?action=xxx�
 
 `isLoopback()` 的实现要点：`[` 开头取方括号内比对 `"::1"`；否则取 `:` 前比对 `"127.0.0.1"` / `"localhost"`；**Host 缺失返回 false**。
 
-### login-flow.ts（386 行）
+### login-flow.ts（448 行）
 
 ```ts
 type LoginPhase = "none" | "pending" | "logging" | "ready" | "expired" | "error";
@@ -494,7 +520,11 @@ none ──start()──→ pending ──扫码──→ logging ──确认�
 
 **`markDead()` 不删 token 文件** —— 401 可能来自临时抖动；重扫会覆盖旧 token。
 
-### publish.ts（222 行）
+**`markDead()` 的两个前提条件（2026-11-11 补，`refreshCatalog()` 里）**：①**号池在服务时不判死** —— 坏的是池成员的凭据，`recordMeasure()` 已经把它标 `dead` 并会在下一次请求换号，这时把主登录改成 `expired` 会让用户以为整个插件掉线；②文案按来源分岔 —— 桌面端凭据失效说"打开官方客户端重新登录"（他从来没扫过码），扫码 token 失效才说"请重新扫码"。`scripts/smoke-pool.mjs` 第 6.6 段正反两面都断言。
+
+**`mode` 字段（2026-11-11 补）**：`LoginSnapshot.mode: "primary" | "pool"` 告诉前端"这一轮扫码是换当前账号，还是往池里加一个成员"。设置卡里两个扫码按钮共用一个 `LoginFlow`，`start(mode)` 先 `cancel()` 再取码 —— 只判 `phase` 会让池区把主登录的码当成自己的显示。`cancel()` / `markReady()` / `markDead()` / `complete()` 的池分支都把它收回 `"primary"`（这四个时刻都意味着这一轮结束了）。详见 `04-ui-surfaces.md` §6.6，断言 ST-18b / ST-18c。
+
+### publish.ts（244 行）
 
 三元门控：
 
@@ -515,7 +545,7 @@ token 空 或 models 空           → "not-configured"  （释放注册）
 
 释放与注册必须在**同一个同步段**完成，中间不能 `await`，否则监听者会看到 provider 短暂消失。
 
-### store.ts（223 行）
+### store.ts（230 行）
 
 ```
 $DSH_HOME/state/dsh-raccoon-web/token.json            （0600）
@@ -528,7 +558,7 @@ $DSH_HOME/state/dsh-raccoon-web/vision-probe.json
 
 `readToken()` **永不抛**，`schemaVersion !== 1` 返回 `undefined`（不做迁移）。
 
-### settings.ts（207 行）
+### settings.ts（221 行）
 
 ```ts
 export const SETTINGS_NS = "dsh-raccoon-web";   // 必须匹配 /^[a-z][a-z0-9-]*$/
@@ -553,7 +583,7 @@ export function normalizeSettings(input: unknown): RaccoonSettings;
 
 `get()` 每次都从内核读（**不缓存闭包**），否则用户改设置我们要重启才生效。
 
-### status.ts（149 行）
+### status.ts（233 行）
 
 `StatusSnapshot` 顶层十个键：
 
@@ -561,7 +591,7 @@ export function normalizeSettings(input: unknown): RaccoonSettings;
 { build, version, login, publish, catalogReady, catalogError?, models, quota, settings, desktopAuth, diagnostics }
 ```
 
-`buildDiagnostics()` 输出 **13 行** `key: value`，**不含 token**，有单测断言不含 `eyJ`。
+`buildDiagnostics()` 输出 **14 行** `key: value`，**不含 token**，有单测断言不含 `eyJ`。
 
 ### cache.ts（75 行）
 
@@ -606,12 +636,12 @@ export function apply(ctx: PluginContext): void;
 
 ---
 
-## 6. `client.js`（1127 行，手写）
+## 6. `client.js`（1,525 行，手写）
 
 ```
 IIFE
 ├── 常量（BUNDLE_NAME / NAMESPACE / STATUS_PATH / ACTION_PATH / BUILD / PROVIDER_ID / 轮询间隔）
-├── 文案字典 zh / en（各 86 键，全内联，不用 locale/*.json）
+├── 文案字典 zh / en（各 117 键 = 88 非 pool + 29 pool，全内联，不用 locale/*.json）
 ├── 样式常量（15 组，全部 var(--dsh-*, fallback) 双写）
 ├── 工具（tFactory / points / compact / clockOf / messageOf）
 ├── 共享 store（listeners / snapshot / lastError / timer / inflight / nextDelay / load / subscribe）
@@ -629,14 +659,18 @@ IIFE
 
 ## 7. 文件大小预算与现状
 
+**实测（2026-11-11，逐文件数行）**：`src/` 合计 **7,370 行** / 28 个文件；`test/` 11 个文件合计 **2,644 行**；`client.js` **1,525 行**。
+
 | 文件 | 预算 | 现状 | 备注 |
 | --- | --- | --- | --- |
 | `src/index.ts` | ≤120 | 125 | 略超，可接受 |
 | `protocol/qr.ts` | ≤500 | 484 | 编码器本身就是长 |
-| `protocol/chat.ts` | ≤250 | 470 | **超标**，帧解析 + thinking + stream 三块可以拆（但拆了会增加理解成本，暂不动） |
-| `host/index.ts` | ≤400 | 742 | **超标**，`runAction` 的八个分支可以拆成 `host/actions.ts` |
+| `protocol/chat.ts` | ≤250 | **505** | **超标**，帧解析 + thinking + stream 三块可以拆（但拆了会增加理解成本，暂不动） |
+| `host/index.ts` | ≤400 | **1,280** | **严重超标**，`runAction` 的 16 个 case（14 个 action 名 + `set-setting`/`set-enabled` 两条同体分支）可以拆成 `host/actions.ts` |
+| `host/pool.ts` | ≤300 | **439** | 超标，排序 + 分类 + 落盘三块可以拆 |
+| `host/login-flow.ts` | ≤300 | **425** | 超标，两套扫码协议的状态机挤在一个类里 |
 | `host/routes.ts` | ≤200 | 237 | 略超 |
-| `client.js` | ≤800 | 1127 | **超标**，但 classic script 拆文件要靠额外的 loader，不划算 |
+| `client.js` | ≤800 | **1,525** | **严重超标**，但 classic script 拆文件要靠额外的 loader，不划算 |
 
 **不强行拆的理由**：`chat.ts` 与 `host/index.ts` 的超标都是"同一件事的连续逻辑"，拆开会让"改一个行为要跳三个文件"。等真正需要复用（比如第二个协议）再拆。
 

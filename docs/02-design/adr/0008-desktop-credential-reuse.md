@@ -5,6 +5,7 @@
 - 决策者: 项目所有者
 - Supersedes: [ADR-0001](./0001-login-via-web-qr.md)（部分：ADR-0001 断言"桌面端凭据不可用"，已被 E-030 推翻）
 - 相关: [E-006](../01-research/05-empirical-findings.md)、[E-029](../01-research/05-empirical-findings.md)、[E-030](../01-research/05-empirical-findings.md)、[E-031](../01-research/05-empirical-findings.md)
+- 补正: 第 77 行「IAM token 本来也没有 legacy refresh grant」**已被 [ADR-0011](./0011-no-token-refresh.md) 纠正**（续期接口存在，见 E-037）。该 ADR 的**结论**（不实现 refresh）不变，只是理由从"没有这个接口"变成"有，但 rotate 会踢掉官方客户端"。按 AGENTS.md 第 3 条，正文保留原样不改。
 
 ---
 

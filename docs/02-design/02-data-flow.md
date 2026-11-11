@@ -30,9 +30,10 @@ bootstrap()
    │
    ├── storedToken = await readToken()          ← $DSH_HOME/state/dsh-raccoon-web/token.json
    ├── probes = await readProbes()
+   ├── accounts = await readPool()              ← $DSH_HOME/state/dsh-raccoon-web/accounts.json
    ├── await resolveToken("bootstrap")          ← 见 §2
    ├── syncPublisher()                          ← 三元门控，可能注册 fallback 名册
-   ├── if (token) {
+   ├── if (activeToken() !== undefined) {       ← **不是 this.token**
    │      await refreshCatalog({ force: false })   ← TtlCache 5min
    │      await refreshQuota({ force: false })     ← TtlCache 60s
    │      syncPublisher()                          ← 名册变了才重新发布
@@ -44,13 +45,15 @@ bootstrap()
 
 **关键约束**：`apply()` 里不能有 `await`。DSH 的插件加载是同步链，`await` 会让整棵树卡在 pending。
 
+**预热判据必须是 `activeToken()` 而不是 `this.token`。** 号池开着时真正在服务的是池成员，`this.token`（当前账号）可能恰好是空的 —— 典型场景是用户装过官方客户端、只用「导入客户端账号」把号加进池、从没扫过码。用 `this.token` 判会让这种用户的首屏永远是"目录未就绪 / 余额未知"。同理 `runAction("refresh-catalog")`、`actionRefreshAuth()`、`actionProbeVision()` 三处的未登录判据也都是 `activeToken()`（2026-11-11 修）。
+
 **失败降级**：
 
 | 失败点 | 结果 |
 | --- | --- |
 | 读 token 抛 | `readToken()` 内部 catch，返回 `undefined` |
 | 桌面端凭据读不到 | `desktopStatus = {found:false, reason:"未找到桌面客户端登录态，已回退到扫码"}` |
-| catalog 401 | 清缓存、`loginFlow.markDead()`、**不删 token** |
+| catalog 401 | 清缓存、`loginFlow.markDead()`、**不删 token**；**号池在服务时不判死**（坏的是池成员，`recordMeasure()` 已标 `dead` 并换号） |
 | catalog 网络错 | `catalog.error` 记文案，`models` 退到 fallback |
 
 ---
@@ -85,24 +88,28 @@ resolveToken(reason)
    └── else token = undefined, phase 保持 none
 ```
 
-`desktopIgnored = true` 的三个触发点：
+`desktopIgnored = true` 的两个触发点（`src/host/index.ts`，逐处核对）：
 
-1. 用户扫码成功（`onReady` 回调里）—— 扫码是明确选择，覆盖桌面端
-2. 用户点「退出登录」（`actionLogout`）而当时用的是桌面端凭据
-3. 无（`refresh-auth` 会把它重置回 `false`）
+1. **用户扫码成功**（`LoginFlow` 的 `onReady` 回调，`src/host/index.ts:187`）—— 扫码是明确选择，覆盖桌面端；
+2. **用户点「退出登录」而当时读到了桌面端凭据**（`actionLogout()`，`src/host/index.ts:446`）—— 桌面端凭据只读不写，这是唯一能表达"我现在不想用这个账号"的方式。
+
+重置回 `false` 只有一处：`actionRefreshAuth()`（`src/host/index.ts:464`），即设置卡里的「重新读取客户端登录态」按钮。**插件重启也会回到 `false`**（它是内存字段，不落盘）。
 
 **桌面端凭据不落盘**的理由：客户端换账号我们下次启动自然跟着变，不需要同步逻辑。
 
+> 号池与这一节是**并列**关系：`resolveToken()` 管"当前账号"（`token.json` / 桌面端），号池由 `resolvePoolAccount()` 另算一路。真正发请求时用的是 `activeToken()` = `resolvePoolAccount()?.token ?? this.token?.token`，池里有可用号就优先池。详见 [07-account-pool.md §2](07-account-pool.md)。
+
 ---
 
-## 3. 扫码登录（两条协议共用一个状态机）
+## 3. 扫码登录（两条协议共用一个状态机，两个入口共用同一个 `LoginFlow`）
 
 ```
 none
- │  POST ?action=login-start
+ │  POST ?action=login-start  { mode: "primary" | "pool" }   ← 池区按钮传 "pool"
  ▼
-start()
+start(mode = "primary")
  ├── cancel()                          ← 作废在途会话（**这就是"刚生成的码立刻失效"的根因**）
+ ├── this.mode = mode                  ← 快照里带出去，前端靠它认领二维码
  ├── protocol = settings.qrProtocol    ← 每轮重读，支持中途切换
  │
  ├── protocol === "web"  （默认）
@@ -139,14 +146,29 @@ tick(generation)
        ▼
      validateToken(token)             ← GET model_catalog，要求 data.categories 是数组
        ├── 不过 → message = "小浣熊账号已授权，但模型网关拒绝了这次登录令牌。请重新扫码…"
-       └── 过   → saveToken({...})    ← 只对来源 qr 落盘
-                  phase = "ready"
-                  onReady(token) → host.setToken() + desktopIgnored = true + refreshCatalog
+       └── 过   → complete()
+                   ├── mode === "primary" → saveToken({...})   ← 只对来源 qr 落盘
+                   │                        phase = "ready"
+                   │                        onReady(token, "primary") → host.setToken() + desktopIgnored = true + refreshCatalog
+                   └── mode === "pool"    → **不写 token.json、不改主登录相位**
+                                            logger.info("login/pool-ready")
+                                            onReady(token, "pool") → host.addPoolAccount()
+                                            mode 收回 "primary"
 ```
 
 **`deadline` 每次轮询成功都按返回到 `expiresIn` 重置** —— 服务端会自己续期。
 
 **为什么 `web` 协议不发网络请求**：code 是本地生成的，二维码内容就是纯本地拼的字符串。少一次往返，也就少一个失败点。
+
+### `mode`：两个扫码入口的隔离
+
+设置卡里「登录」区与「账号池」区各有一个扫码按钮，但**底下只有一个 `LoginFlow`**。`start()` 第一件事是 `cancel()`，所以：
+
+1. 池区点「扫码添加」→ `start("pool")`，`phase = pending`；
+2. 又去点「扫码登录」→ `start("primary")`，取消上一轮并生成新码，`phase` **仍是** `pending`；
+3. 池区若只判 `phase`，就会继续显示一张已经属于主登录的二维码 —— 用户扫完 token 写进 `token.json`，池里没多号。
+
+所以 `LoginSnapshot.mode` 一路透传到 `StatusLogin.mode`，池区用 `login.mode === 'pool'` 认领、登录区在 `mode === 'pool'` 时改显示 `loginPoolBusy`。`cancel()` / `markReady()` / `markDead()` / `complete()` 的池分支都把它收回 `"primary"`（这四个时刻都意味着这一轮结束了）。前端两段判据与两个"为什么"见 [04-ui-surfaces.md §6.6](04-ui-surfaces.md)，断言 ST-18b / ST-18c。
 
 ---
 

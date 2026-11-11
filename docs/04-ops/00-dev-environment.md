@@ -172,9 +172,11 @@ npm run build              # 只复制 + 静态检查
 #   __DSH_BUILD_raccoon     ← 应该等于 src/build.ts 里的 BUILD
 
 # 跑测试
-npm test                   # 168 个用例，~0.4 秒
+npm test                   # 220 个用例 / 45 suite，~0.7 秒
 npm run typecheck
-npm run smoke              # 宿主半身 + provider 装配（不碰网络）
+npm run smoke              # 宿主半身 + provider + 号池（不碰网络）
+npm run smoke:client       # 离线跑 client.js 的 apply（能复现"设置页空白"）
+npm run smoke:client:twice # 模拟同一包被加载两次
 npm run smoke:live         # 桌面端凭据 → 真网关（需要已登录客户端）
 npm run smoke:chat         # 真对话（会花少量积分）
 ```

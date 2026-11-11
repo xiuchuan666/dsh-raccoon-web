@@ -70,6 +70,23 @@ export interface PublishInput {
   models: readonly ModelDescriptor[];
   /** 当前 token。undefined = 未登录。 */
   token: string | undefined;
+  /**
+   * 号池当前选中账号的设备身份（ADR-0010）。
+   *
+   * **它必须进指纹。** 设备头写在 descriptor 的 `headers` 里，而 pi-ai 的
+   * `profileOptions()` 不透传每请求 headers —— 换号只能靠换名册。
+   * 少了这一项，号池换号之后发出去的请求还带着上一个账号的 device id，
+   * 而那个 id 正是上游用来区分"这个账号的设备"的东西。
+   */
+  deviceId?: string;
+}
+
+/** 号池路径下的账号解析（ADR-0010）。老路径不传。 */
+export interface PublishAccountResolver {
+  /** 这次请求用哪个账号的 token + 设备身份。 */
+  resolve: () => Promise<{ token: string; deviceId: string } | undefined>;
+  /** 一次请求的 HTTP 状态，用于记测量。 */
+  onResponse: (status: number) => void;
 }
 
 /** 发布状态。给诊断块用。 */
@@ -126,7 +143,11 @@ export class Publisher {
    * @param input 开关 / 名册 / token。
    * @param resolveToken 每次请求时读 token 的函数（pi-ai 内部会调）。
    */
-  sync(input: PublishInput, resolveToken: () => Promise<string | undefined>): PublishState {
+  sync(
+    input: PublishInput,
+    resolveToken: () => Promise<string | undefined>,
+    account?: PublishAccountResolver,
+  ): PublishState {
     if (!input.enabled) {
       this.dispose("disabled");
       return this.lastState;
@@ -136,7 +157,7 @@ export class Publisher {
       return this.lastState;
     }
 
-    const signature = `${rosterSignature(input.models)}|${input.reasoningEnabled ? 1 : 0}`;
+    const signature = `${rosterSignature(input.models)}|${input.reasoningEnabled ? 1 : 0}|dev:${input.deviceId ?? "-"}`;
     if (this.handle !== undefined && signature === this.lastSignature) {
       // 名册与开关都没变：保留现有注册。这是最常见的路径（每次刷新目录都走这里）。
       this.lastState = "published";
@@ -148,6 +169,7 @@ export class Publisher {
       displayName: "小浣熊",
       resolveToken,
       reasoningEnabled: input.reasoningEnabled,
+      ...(account === undefined ? {} : { resolveAccount: account.resolve, onResponse: account.onResponse }),
       ...(this.get === undefined ? {} : { get: this.get }),
     });
 

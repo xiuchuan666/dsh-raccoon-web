@@ -16,9 +16,10 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import { createTtlCache } from "../src/host/cache.js";
+import { LoginFlow } from "../src/host/login-flow.js";
 import { createLogger, formatLine, tokenTag } from "../src/host/log.js";
 import { Publisher, rosterSignature } from "../src/host/publish.js";
-import { isLoopback } from "../src/host/routes.js";
+import { isLoopback, loginBlock } from "../src/host/routes.js";
 import { DEFAULT_SETTINGS, normalizeSettings } from "../src/host/settings.js";
 import { PROBE_PNG_BASE64, solidPng } from "../src/host/solid-png.js";
 import { buildDiagnostics } from "../src/host/status.js";
@@ -91,6 +92,7 @@ describe("normalizeSettings", () => {
       "contextCap",
       "debugLog",
       "enabled",
+      "poolEnabled",
       "qrProtocol",
       "reasoning",
       "visionProbeOverride",
@@ -301,6 +303,60 @@ describe("isLoopback", () => {
   });
 });
 
+describe("loginBlock", () => {
+  it("ST-18b: 透传 mode，让前端分辨这张码是主登录还是加池成员", () => {
+    // 设置卡的「登录」区与「账号池」区共用同一个 LoginFlow：一边点扫码会把
+    // 另一边正在等的码取消掉（start() 先 cancel 再取码），相位仍是 pending。
+    // 前端只能靠 mode 认领"这张码是不是我的"，所以它必须出现在 status 里。
+    const pool = loginBlock({ phase: "pending", mode: "pool", qrSvg: "<svg/>", deadline: 1 }, undefined);
+    assert.equal(pool.mode, "pool");
+    assert.equal(pool.phase, "pending");
+
+    const primary = loginBlock({ phase: "pending", mode: "primary", qrSvg: "<svg/>", deadline: 1 }, undefined);
+    assert.equal(primary.mode, "primary");
+
+    // 没有 mode（老快照 / 手写夹具）时不要凭空造一个，字段直接不出现。
+    const bare = loginBlock({ phase: "none" }, undefined);
+    assert.equal("mode" in bare, false);
+    assert.equal("qrSvg" in bare, false);
+  });
+});
+
+describe("LoginFlow 的 mode 生命周期", () => {
+  /** 造一个不碰网络的 LoginFlow（web 协议取码纯本地，不会发请求）。 */
+  function makeFlow(): LoginFlow {
+    return new LoginFlow({
+      logger: silentLogger(),
+      renderQr: () => "<svg/>",
+      onReady: () => undefined,
+      now: () => 1_700_000_000_000,
+      qrProtocol: () => "web",
+    });
+  }
+
+  it("ST-18c: start('pool') 之后快照报 mode=pool，其余路径都回到 primary", () => {
+    const flow = makeFlow();
+    assert.equal(flow.snapshot().mode, "primary", "初始是主登录");
+
+    // 号池扫码：快照必须能告诉前端"这张码是加池成员的"。
+    // 否则用户点了登录区的扫码，池区的二维码看起来还在等，扫完却写进 token.json。
+    void flow.start("pool");
+    assert.equal(flow.snapshot().mode, "pool");
+
+    flow.cancel();
+    assert.equal(flow.snapshot().mode, "primary", "取消之后这一轮就没有目的了");
+
+    void flow.start("pool");
+    flow.markReady();
+    assert.equal(flow.snapshot().mode, "primary", "ready 描述的是当前账号，不是某一轮扫码");
+
+    void flow.start("pool");
+    flow.markDead("测试");
+    assert.equal(flow.snapshot().mode, "primary", "判死说的是当前账号");
+    flow.dispose();
+  });
+});
+
 describe("日志脱敏", () => {
   it("ST-20: tokenTag 是 8 位 hex，且不含 token 片段", () => {
     const tag = tokenTag("xhx_super_secret_value");
@@ -342,7 +398,7 @@ describe("solidPng", () => {
 });
 
 describe("buildDiagnostics", () => {
-  it("ST-25: 输出 13 行 key: value（含桌面端/来源/扫码协议），且不含 token", () => {
+  it("ST-25: 输出 14 行 key: value（含桌面端/来源/扫码协议/号池），且不含 token", () => {
     const snapshot = {
       build: "2026-11-06T11:10",
       version: "0.1.0",
@@ -353,10 +409,11 @@ describe("buildDiagnostics", () => {
       quota: { available: 1234, permanent: 100, daily: 50, dailyGranted: true, at: 0 },
       settings: { ...DEFAULT_SETTINGS },
       desktopAuth: { found: false, reason: "未找到桌面客户端登录态，已回退到扫码" },
+      pool: { enabled: false, ready: false, total: 0, enabledCount: 0, accounts: [] },
       diagnostics: "",
     };
     const text = buildDiagnostics({ build: snapshot.build, version: snapshot.version, snapshot });
-    assert.equal(text.split("\n").length, 13);
+    assert.equal(text.split("\n").length, 14);
     assert.ok(text.includes("插件: dsh-raccoon-web 0.1.0"));
     assert.ok(text.includes("登录: ready (xhx_token)"));
     assert.ok(text.includes("来源: 扫码"));
@@ -364,9 +421,54 @@ describe("buildDiagnostics", () => {
     assert.ok(text.includes("扫码协议: Web auth（官方桌面端同款）"));
     assert.ok(text.includes("目录: 1 个模型"));
     assert.ok(text.includes("余额: 1234"));
+    assert.ok(text.includes("号池: 关（池空）"));
     // 脱敏：不能出现任何 token 形态
     assert.ok(!/eyJ[A-Za-z0-9_-]{10,}/.test(text));
     assert.ok(!text.includes("xhx_super"));
+  });
+
+  it("ST-25b: 号池开启时诊断行报启用数与当前账号前 8 位", () => {
+    const snapshot = {
+      build: "2026-11-06T11:10",
+      version: "0.1.0",
+      login: { phase: "ready" as const, principal: "abc12345", kind: "xhx_token" as const, source: "qr" as const },
+      publish: "published" as const,
+      catalogReady: true,
+      models: [],
+      quota: { available: undefined, permanent: undefined, daily: undefined, dailyGranted: null, at: 0 },
+      settings: { ...DEFAULT_SETTINGS, poolEnabled: true },
+      desktopAuth: { found: false },
+      pool: {
+        enabled: true,
+        ready: true,
+        total: 3,
+        enabledCount: 2,
+        activeId: "0123456789abcdef",
+        accounts: [],
+      },
+      diagnostics: "",
+    };
+    const text = buildDiagnostics({ build: snapshot.build, version: snapshot.version, snapshot });
+    assert.equal(text.split("\n").length, 14);
+    assert.ok(text.includes("号池: 开（2 个启用，当前 01234567）"));
+  });
+
+  it("ST-25c: 号池开但一个都没启用时说明「还是用当前账号」", () => {
+    const snapshot = {
+      build: "2026-11-06T11:10",
+      version: "0.1.0",
+      login: { phase: "none" as const },
+      publish: "not-configured" as const,
+      catalogReady: false,
+      models: [],
+      quota: { available: undefined, permanent: undefined, daily: undefined, dailyGranted: null, at: 0 },
+      settings: { ...DEFAULT_SETTINGS, poolEnabled: true },
+      desktopAuth: { found: false },
+      pool: { enabled: true, ready: true, total: 2, enabledCount: 0, accounts: [], note: "有账号但一个都没勾选启用，所以还是用当前账号。" },
+      diagnostics: "",
+    };
+    const text = buildDiagnostics({ build: snapshot.build, version: snapshot.version, snapshot });
+    assert.ok(text.includes("号池: 开（2 个账号，0 个启用）"));
   });
 });
 

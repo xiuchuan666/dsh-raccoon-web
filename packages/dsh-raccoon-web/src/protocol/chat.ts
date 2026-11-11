@@ -16,7 +16,18 @@
 import { createHash } from "node:crypto";
 
 import { FIRST_BYTE_TIMEOUT_MS, LLM_BASE, STREAM_IDLE_TIMEOUT_MS } from "./consts.js";
-import { RaccoonError, isDeadSessionCode, isRateLimitCode, isRateLimited, toRaccoonError } from "./errors.js";
+import {
+  BODY_LIMIT_BYTES,
+  IMAGE_DOWNLOAD_HINT,
+  OVERSIZE_HINT,
+  RaccoonError,
+  isDeadSessionCode,
+  isImageError,
+  isOversizeError,
+  isRateLimitCode,
+  isRateLimited,
+  toRaccoonError,
+} from "./errors.js";
 import { chatHeaders } from "./headers.js";
 
 /** 请求里的消息（OpenAI 形状的超集）。 */
@@ -348,13 +359,17 @@ export async function chatStream(
   };
   options.signal?.addEventListener("abort", onExternalAbort, { once: true });
 
+  // 请求体只序列化一次：既要发出去，也要在失败时量出真实字节数（E-019 的 3 MiB 判定要用）。
+  const bodyText = JSON.stringify(body);
+  const bodyBytes = Buffer.byteLength(bodyText);
+
   try {
     let res: Response;
     try {
       res = await fetchImpl(`${LLM_BASE}/chat/completions`, {
         method: "POST",
         headers: chatHeaders(token, sessionId),
-        body: JSON.stringify(body),
+        body: bodyText,
         redirect: "error",
         signal: controller.signal,
       });
@@ -391,8 +406,28 @@ export async function chatStream(
       if (isRateLimited(res.status, text)) {
         throw new RaccoonError("RATE_LIMIT", "小浣熊限流", { status: res.status, upstream: text });
       }
-      if (res.status === 413) {
-        throw new RaccoonError("INVALID_REQUEST", "请求体太大（HTTP 413）", { status: 413, upstream: text });
+      // E-019：超限返回的是 400 `inference request is invalid`，不是 413。
+      // 所以除了照旧处理 413，还要在 400 上按"本地量出的真实字节数"和 message 一起判。
+      if (res.status === 413 || (res.status === 400 && isOversizeError(text))) {
+        const near = bodyBytes >= BODY_LIMIT_BYTES * 0.9;
+        const message =
+          res.status === 413
+            ? "请求体太大（HTTP 413）"
+            : `请求体太大（${bodyBytes} 字节，上游上限约 ${BODY_LIMIT_BYTES} 字节）`;
+        throw new RaccoonError("INVALID_REQUEST", message, {
+          status: res.status,
+          upstream: text,
+          // 只有"确实接近上限"才给体积提示；否则这句话会把参数错误也说成体积问题。
+          ...(near || res.status === 413 ? { hint: OVERSIZE_HINT } : {}),
+        });
+      }
+      // E-018：`image download failed` 是服务端下载不到那个 URL，不是不支持图片。
+      if (res.status === 400 && isImageError(text)) {
+        throw new RaccoonError("INVALID_REQUEST", "小浣熊处理不了这张图片", {
+          status: res.status,
+          upstream: text,
+          hint: IMAGE_DOWNLOAD_HINT,
+        });
       }
       if (res.status >= 500) {
         throw new RaccoonError("SERVER", `小浣熊上游返回 HTTP ${res.status}`, { status: res.status, upstream: text });

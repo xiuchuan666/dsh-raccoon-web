@@ -44,7 +44,7 @@
 ### 症状
 
 - 设置 → 插件里没有「小浣熊」卡片
-- `curl http://127.0.0.1:57292/plugins/dsh-raccoon-web/status` → **404**
+- `curl http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/status` → **404**
 
 ### 先看一件事：`cordis.patch.yml` 里那条 `name` 写的是什么
 
@@ -194,9 +194,9 @@ curl.exe -s "http://127.0.0.1:<PORT>/plugins/??dsh-raccoon-web/client.js&rev=<re
 
 请求的 `Host` 头不是 `127.0.0.1` / `localhost` / `[::1]`。这是**正确行为**（防止局域网别人读你的状态）。触发场景：
 
-- 从别的机器访问 `http://<你的IP>:57292/...`
+- 从别的机器访问 `http://<你的IP>:<PORT>/...`
 - 反向代理没重写 Host
-- 用了 `http://0.0.0.0:57292/...`
+- 用了 `http://0.0.0.0:<PORT>/...`
 
 本机访问就用 `127.0.0.1`。
 
@@ -213,13 +213,13 @@ ctx.inject(["settings"], (sub) => {
 漏了 `sub.inject(["webServer"], ...)` 就 404。手工验证：
 
 ```powershell
-node -e "fetch('http://127.0.0.1:57292/plugins/dsh-raccoon-web/status').then(r=>console.log(r.status))"
+node -e "fetch('http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/status').then(r=>console.log(r.status))"
 ```
 
 ### 3.3 200 但内容不对
 
 ```powershell
-curl.exe -s "http://127.0.0.1:57292/plugins/dsh-raccoon-web/status" > .tmp\s.json
+curl.exe -s "http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/status" > .tmp\s.json
 node -e "const s=require('./.tmp/s.json');console.log(JSON.stringify({build:s.build,publish:s.publish,phase:s.login.phase,source:s.login.source,models:s.models.length,desktop:s.desktopAuth},null,1))"
 ```
 
@@ -236,7 +236,7 @@ node -e "const s=require('./.tmp/s.json');console.log(JSON.stringify({build:s.bu
 | `models` | **未登录也非空**（5 条 fallback），这是有意的 |
 | `settings` | 七个键：`enabled` / `reasoning` / `visionProbeOverride` / `contextCap` / `debugLog` / `authSource` / `qrProtocol` |
 | `desktopAuth` | `{found, path?, expiresAt?, reason?}` |
-| `diagnostics` | 13 行，真换行，**不含 token** |
+| `diagnostics` | 14 行，真换行，**不含 token** |
 
 `phase: "ready"` 且 `catalogReady: false` → 目录没拉到，去 §5.1。
 
@@ -266,16 +266,27 @@ node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs -e "i
 
 ### 4.2 `phase: "expired"` 或 `desktopAuth.reason` 提到过期
 
-官方客户端的 IAM JWT 有效期约 30 天，**过期了插件不会自动续**（IAM token 没有 legacy refresh grant，`isIamToken()` 为真时官方自己也不走 refresh）。
+官方客户端的 IAM JWT 有效期约 30 天，**过期了插件不会自动续**。
+
+> **更正（2026-11-11，E-037）**：这里原来写的是"IAM token 没有 legacy refresh grant"。**接口是存在的** —— `POST /api/web/auth/v1/refresh`，body 字段名是 `token`。但它会 **rotate**：一旦续期成功，官方客户端手里那个就失效了，等于把用户从客户端里踢下线；而且官方桌面端自己也不调它（asar 里这个 URL 只出现在一段 SDK 文档里，`callScore=0`）。四轮探针都没试出它的 `token` 格式校验规则（17 种形状全是 `100002 param token invalid format invalid`）。**所以仍然不做自动续期，但理由从"没有这个接口"变成"有，但用了会伤到用户"。**
 
 解决：打开官方客户端，它会自己续；或者把 `authSource` 切成 `qr` 扫码。
+
+界面上的提示按来源分岔（2026-11-11 起）：
+
+| 来源 | `login.message` | 用户该做什么 |
+| --- | --- | --- |
+| 桌面端凭据 | 客户端凭据已失效，请打开官方客户端重新登录。 | 打开官方客户端（我们只读，续不了） |
+| 扫码 token | 登录已失效，请重新扫码。 | 在设置卡里重新扫码 |
+
+**号池在服务时不会走到这里** —— 池成员的凭据坏了由 `recordMeasure()` 标 `dead` 并换号，主登录相位不动。看到 `expired` 说明"当前账号"这条线真的断了。
 
 ### 4.3 `phase: "ready"` 但界面还说未登录
 
 前端拿到的 `login` 块里 `phase` 没更新：
 
 ```powershell
-node scripts/login-qr.mjs --wait-only --port 57292
+node scripts/login-qr.mjs --wait-only --port <PORT>
 ```
 
 它会只读轮询、**绝不换码**。若这里已经 `ready`，说明是浏览器缓存 → Ctrl+Shift+R。
@@ -285,7 +296,7 @@ node scripts/login-qr.mjs --wait-only --port 57292
 `authSource: desktop` 是**严格模式**：读不到就明确报错，不会偷偷回落到扫码 token。切回 `auto`（默认）才会回落。改法：
 
 ```powershell
-curl.exe -s -X POST "http://127.0.0.1:57292/plugins/dsh-raccoon-web/action?action=set-setting" -H "content-type: application/json" -d "{\"key\":\"authSource\",\"value\":\"auto\"}"
+curl.exe -s -X POST "http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/action?action=set-setting" -H "content-type: application/json" -d "{\"key\":\"authSource\",\"value\":\"auto\"}"
 ```
 
 改 `authSource` 会自动重跑一次凭据解析（`actionSetSetting` 里特判），不用手动 `refresh-auth`。
@@ -300,7 +311,7 @@ curl.exe -s -X POST "http://127.0.0.1:57292/plugins/dsh-raccoon-web/action?actio
 
 ```powershell
 # 强制重新解析凭据 + 重新拉目录 + 重新注册
-curl.exe -s -X POST "http://127.0.0.1:57292/plugins/dsh-raccoon-web/action?action=refresh-auth"
+curl.exe -s -X POST "http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/action?action=refresh-auth"
 ```
 
 返回：
@@ -314,7 +325,7 @@ curl.exe -s -X POST "http://127.0.0.1:57292/plugins/dsh-raccoon-web/action?actio
 设置里 `enabled` 被关了：
 
 ```powershell
-curl.exe -s -X POST "http://127.0.0.1:57292/plugins/dsh-raccoon-web/action?action=set-setting" -H "content-type: application/json" -d "{\"key\":\"enabled\",\"value\":true}"
+curl.exe -s -X POST "http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/action?action=set-setting" -H "content-type: application/json" -d "{\"key\":\"enabled\",\"value\":true}"
 ```
 
 ### 5.3 `publish: "published"` 但选择器里没有
@@ -326,7 +337,7 @@ curl.exe -s -X POST "http://127.0.0.1:57292/plugins/dsh-raccoon-web/action?actio
 3. 还不行就看 `status.models` 的 `id` 与选择器里的名字对不对得上（显示名是 `${description} · x${billing_multiplier}`）
 
 ```powershell
-curl.exe -s -X POST "http://127.0.0.1:57292/plugins/dsh-raccoon-web/action?action=refresh-catalog" | Select-String '"ok":true'
+curl.exe -s -X POST "http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/action?action=refresh-catalog" | Select-String '"ok":true'
 ```
 
 ### 5.4 目录里少了模型
@@ -338,7 +349,7 @@ curl.exe -s -X POST "http://127.0.0.1:57292/plugins/dsh-raccoon-web/action?actio
 `contextCap` 默认 128000，`toDescriptor()` 与 `statusModels()` 用同一套截断（`Math.min(upstream, cap)`）。设置卡改 `contextCap` 会同时改两边：
 
 ```powershell
-curl.exe -s -X POST "http://127.0.0.1:57292/plugins/dsh-raccoon-web/action?action=set-setting" -H "content-type: application/json" -d "{\"key\":\"contextCap\",\"value\":256000}"
+curl.exe -s -X POST "http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/action?action=set-setting" -H "content-type: application/json" -d "{\"key\":\"contextCap\",\"value\":256000}"
 ```
 
 改完 `status.models[].contextWindow` 应该立刻跟着变（`set-setting` 内部会 `refresh-catalog` 并重新注册）。
@@ -376,7 +387,7 @@ node scripts/login-qr.mjs --wait-only   # 后台盯状态，绝不换码
 切协议：
 
 ```powershell
-curl.exe -s -X POST "http://127.0.0.1:57292/plugins/dsh-raccoon-web/action?action=set-setting" -H "content-type: application/json" -d "{\"key\":\"qrProtocol\",\"value\":\"iam\"}"
+curl.exe -s -X POST "http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/action?action=set-setting" -H "content-type: application/json" -d "{\"key\":\"qrProtocol\",\"value\":\"iam\"}"
 ```
 
 切换会作废在途会话（`start()` 每轮重新读协议）。
@@ -408,7 +419,7 @@ node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scrip
 
 | 界面文案（开头） | kind | 真实原因 |
 | --- | --- | --- |
-| 小浣熊登录已失效… | AUTH | 401 / 403 / 业务码 200003 |
+| 小浣熊登录已失效… | AUTH | 401 / 403 / 业务码 200003。**按来源给下一步**：桌面端凭据 → 打开官方客户端重登；扫码 token → 重新扫码（2026-11-11 起） |
 | 小浣熊账号的模型吞吐已达上限… | RATE_LIMIT | HTTP 429，或 **HTTP 200 + `{"code":200429}`**，或响应体含 `user_model_rate_limited` |
 | 小浣熊服务端出错了… | SERVER | 5xx，或流里带 error 帧 |
 | 小浣熊响应超时… | TIMEOUT | 60s 无首字节 / 120s 无新帧 |
@@ -427,7 +438,7 @@ node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scrip
 确认构建：
 
 ```powershell
-curl.exe -s "http://127.0.0.1:57292/plugins/dsh-raccoon-web/status" | Select-String '"build"'
+curl.exe -s "http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/status" | Select-String '"build"'
 ```
 
 ### 7.3 首字节超时（60s）
@@ -545,7 +556,7 @@ ctx.effect(() => ..., "label")                     // 旧式写法（三个参�
 | --- | --- | --- |
 | DSH 启动变慢 | `apply` → `bootstrap` 的耗时 | `apply()` 必须**同步返回**，异步全走 `void bootstrap()`；不能有 `await fetch` |
 | 内存持续涨 | 任务管理器看宿主进程 | `TtlCache` 有 inflight 去重但无上限（模型数量有限，可接受）；检查订阅有没有 `off` |
-| 界面卡顿 | 药丸 20s 轮询 | 失焦应暂停（`document.visibilityState`），登录中才 1.5s |
+| 界面卡顿 | 药丸 20s 轮询 | 登录中才 1.5s；**不做失焦暂停**（浏览器后台本来就降频），切回可见时补拉一次 |
 | 长时间不用后第一次对话慢 | 正常（凭据解析 + 目录刷新） | 不用管 |
 | 每 20 秒一次 `/status` 请求 | 正常 | 药丸轮询；设置卡 5s；出错退避 30s→60s |
 
@@ -553,31 +564,34 @@ ctx.effect(() => ..., "label")                     // 旧式写法（三个参�
 
 ## 11. 收集诊断信息
 
-设置卡点「复制诊断信息」得到 13 行：
+设置卡点「复制诊断信息」得到 14 行（下面是 2026-11-11 真宿主 52091 的原样输出）：
 
 ```
 插件: dsh-raccoon-web 0.1.0
-构建: 2026-11-06T12:35
-平台: win32 x64 / node v24.21.0
-登录: ready
+build: 2026-11-11T23:05
+平台: win32 / node v24.21.0
+登录: ready (access_token)
 来源: 官方客户端凭据
 桌面端: 已读到 (C:\Users\Administrator\.office-raccoon\agent\config\auth.json)
-账号: pu-01a19…
+账号: pu-01a19
 provider: published
 目录: 6 个模型
-余额: 11,682（永久 10,500 / 每日 1,182）
-上下文上限: 128000
+余额: 383
+上下文上限: 1000000
 思考: 开
 扫码协议: Web auth（官方桌面端同款）
+号池: 关（池空）
 ```
 
 **里面没有 token**。设计上 token 从不进浏览器，所以这段天然安全。
+
+第 14 行「号池」五种形态：`关（池空）` / `关（N 个账号，未启用自动换号）` / `开（池空）` / `开（N 个账号，0 个启用）` / `开（N 个启用，当前 xxxxxxxx）`。
 
 要更细的信息：
 
 ```powershell
 # 完整 status（含 qrSvg，别整段贴出来）
-curl.exe -s "http://127.0.0.1:57292/plugins/dsh-raccoon-web/status" > .tmp\s.json
+curl.exe -s "http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/status" > .tmp\s.json
 
 # 真对话事件序列
 npm run smoke:chat

@@ -180,7 +180,7 @@
 | --- | --- | --- | --- | --- |
 | 10.1 | `client.js` 骨架 + loader | 0.5 | 01.1 | |
 | 10.2 | locale（zh/en） | 1 | 10.1 | 约 60 条 |
-| 10.3 | `useStatus` 钩子 | 1 | 09.7 | 20s + 失焦暂停 |
+| 10.3 | `useStatus` 钩子 | 1 | 09.7 | 20s + 切回可见补拉（失焦暂停未做） |
 | 10.4 | `action()` 封装 | 0.5 | 09.8 | |
 | 10.5 | `CreditPill` | 1 | 10.3 | 三态 |
 | 10.6 | `SettingsCard` 骨架 | 1 | 10.3 | |
@@ -340,6 +340,57 @@
 - 第一轮 WBS 的**任务粒度与依赖关系仍然有效**（T-04∥T-05 可并行、T-08.6 是 M3 硬阻塞都没错）。
 - 失效的是**绝对时长**，以及"登录只有扫码一条路"这个前提。
 -  milestones：M1–M4 全部达成（桌面端路线），**M5 待发布**；扫码路线代码完备但端到端仍缺一次人工手机确认。
+
+---
+
+## 第三轮耗时回填：账号池 + 两个客户端 bug（2026-11-11）
+
+第一轮按"一个账号、扫码登录"估的。第二轮换了凭据来源。**这一轮是用户 m05082 提的三件事 + 一个新功能**：
+
+1. 输入框里看不到实时积分
+2. 设置里的插件页面打开是空白
+3. 想建号池：多账号统一管理、额度用完自动换号、一键全账号签到、每账号独立环境防封
+
+前两件是**同一个根因**（DSH 升到 0.2.2-rc.1 后 `apply()` 第一句抛错，三个 slot 全没注册），第三件是新能力。
+
+同样不编小时数，只记**新增任务、落在哪、前两轮 WBS 有没有预估到**。
+
+### 新增任务清单
+
+| # | 任务 | 落在哪 | 前两轮预估到？ |
+| --- | --- | --- | --- |
+| P-1 | 定位"积分不显示 + 设置页空白"的共同根因：`locale.register()` 重复 locale 抛错，后面三个 `slots.inject` 全部不执行 | `client.js` 的 `apply()` | ✗ 第一轮把 locale 注册当成"肯定成功"的第一步 |
+| P-2 | `apply()` 分步容错：locale 注册单独 try/catch、三个 slot 各包一层 `guard()`、`bindTranslator()` 回落 | `client.js` | ✗ |
+| P-3 | 新增 `scripts/smoke-client-apply.mjs`：用 `node:vm` 离线跑 `apply`，`--twice` 复现重复加载；能抓住旧版 bug（旧版第二次 apply 注册 0 个 slot） | `scripts/` + `package.json` | ✗ T-11 只预估了"真宿主冒烟" |
+| P-4 | 积分药丸改成总是显示（用户默认模型是 `workbuddy-global`，旧逻辑只在选中小浣熊时渲染 → 永不出现） | `client.js` 的 `CreditPillGate` / `CreditPill` | ✗ |
+| P-5 | 逆向 asar 出签到写接口 `POST /api/web/desktop/v1/login/points/grant`，实测 200 且幂等 → **推翻"上游没有签到接口"** | `points.ts` 的 `grantDaily()` + E-036 | ✗ `points.ts` 文件头原本写着"只读，不实现任何领取" |
+| P-6 | 逆向设备身份机制：`X-Client-Device-ID` 是唯一抓手，SDK 要求 Desktop 传真实 install ID | E-038 + `headers.ts` 加第三参 | ✗ |
+| P-7 | `pool.ts` 新模块：`accounts.json` 多 token 存储（`0600` + 原子写）、`sortForUse()` 五条排序、`classifyMeasure()` 分类、`nextRaccoonMidnight()` | `src/host/pool.ts` | ✗ |
+| P-8 | 选号接在 `resolveApiKey`、记测量接在 `onResponse`；设备身份进 descriptor（名册级属性）→ 换号必须重建名册，指纹加 `dev:<deviceId>` | `provider/adapter.ts` / `api.ts` / `roster.ts` / `host/publish.ts` | ✗ |
+| P-9 | `LoginFlow` 加 `LoginMode = "primary" / "pool"`：池模式**不写 `token.json`、不改主登录相位** | `host/login-flow.ts` | ✗ |
+| P-10 | 六个新 action：`pool-add-start` / `pool-import-desktop` / `pool-toggle` / `pool-remove` / `pool-checkin` / `pool-test` | `host/index.ts` 的 `runAction()` | ✗ |
+| P-11 | 诊断块 13 → 14 行（「号池」五种形态），同步改 ST-25 / ST-25b / ST-25c | `host/status.ts` + `test/host.test.ts` | ✗ |
+| P-12 | `PoolSection` 客户端 UI（账号卡片、勾选即时生效、两段式删除、二维码跟宿主状态走） | `client.js` | ✗ |
+| P-13 | 修 `device` 显示成 `raccoon-`（`slice(0,8)` 把前缀整个吃掉） | `host/index.ts` 的 `poolSnapshot()` | ✗ |
+| P-14 | 真宿主端到端：导入 → 测试（零 token 成本打目录端点）→ 勾选 → 开关 → `activeId` 正确 → 诊断第 14 行 | 端口 52091，build `2026-11-11T23:05` | 部分（T-11 只预估了"能加载"） |
+| P-15 | 补 `test/pool.test.ts`（PO-1 ~ PO-35，10 个 suite）：纯函数全覆盖 + 落盘往返 | `test/` | ✗ |
+| P-16 | 补 `scripts/smoke-pool.mjs`（初版 10 段 41 条，后补到 **12 段 56 条**）：真 `RaccoonHost` + 假网关跑六个 action，验设备头真的进了请求、换号真的重建名册、签到真的先查后写 | `scripts/` + `package.json` 的 `smoke` / `smoke:pool` | ✗ |
+
+### 偏差教训（这一轮新增六条）
+
+1. **`apply()` 里任何一步都不该是"肯定成功"的。** 第一句 `ctx.locale.register()` 抛错，后面三句全没执行 —— 用户看到的是"两个不相关的 bug"（药丸没了 + 设置页空白），实际是同一个。**能失败的步骤必须各自兜住，且失败要 `console.error` 留痕**（否则浏览器里什么都看不到，只能靠猜）。
+2. **"总是显示"比"条件显示"更安全。** 药丸只在选中小浣熊时显示，看起来是"精准"，实际是"用户换个默认模型就再也看不到"。**能被用户误判成"插件坏了"的隐藏，不如多给一行解释。**
+3. **文档里的"不做"要写理由，不写理由就会被自己推翻时无从判断。** `points.ts` 文件头写着"浣熊没有独立的签到接口，只读不实现领取" —— 这句话在 asar 里被一条 URL 推翻。**当初写的时候如果附了"我 grep 了哪些关键词"，这次两分钟就能确认要不要重查。**
+4. **离线冒烟比让用户看 Console 强得多。** `smoke-client-apply.mjs` 用 `node:vm` 造一个照抄 0.2.2 语义的替身 ctx，能复现"重复加载"这种真宿主上极难触发的场景，也能拿历史版本的 `client.js` 做回归（`RACCOON_CLIENT=<path>`）。
+5. **冒烟夹具用错 schema 会伪装成产品 bug。** `smoke-pool.mjs` 第一版假 settings 写的是 `(raw) => raw`，`enabled` 全是 `undefined`，`Publisher.sync()` 第一道门控判 `disabled` → 五条断言挂掉，看着像"换号不重建名册"，其实是夹具。**夹具必须复用被测代码自己的归一化函数**（`normalizeSettings`）。
+6. **派生 id 的夹具不能手编。** 池里账号 id 是 `sha256(principal).slice(0,16)`；夹具写 `"aaaaaaaaaaaaaaaa"` 而 principal 是 `"pu-account-a"` 时，`upsertAccount()` 算出的 id 对不上 → `pool-import-desktop` 变成"追加第 4 个号"而不是"更新"。**凡是被测代码会重新计算一遍的字段，夹具都要按同一算法生成。**
+
+### 复核结论（这一轮）
+
+- **号池是并列能力，不是替换**：`authSource` 三态（`auto`/`desktop`/`qr`）没动，`poolEnabled` 默认 `false`，关掉立刻走老路径。
+- **签到与自动换号解耦**：workbuddy 曾把签到按钮挂在开关上，用户关掉后再也没法签到。这里刻意让签到/测试**始终可用**。
+- **"独立环境"没有承诺防封**：只做每账号一个稳定随机 `X-Client-Device-ID`（上游 SDK 认这个头），不做指纹伪造、不装真实设备 SDK。文档与 UI 文案都不说"防封"。
+- **仍未验的两处**：签到"真的领到"分支（要等次日零点后）、号池扫码加号（要用户手机）。
 
 ---
 

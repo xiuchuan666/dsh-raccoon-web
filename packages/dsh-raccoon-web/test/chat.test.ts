@@ -18,7 +18,7 @@ import {
   principalOf,
   sessionIdFor,
 } from "../src/protocol/chat.js";
-import { RaccoonError } from "../src/protocol/errors.js";
+import { HINTS, RaccoonError } from "../src/protocol/errors.js";
 import { failure, fakeFetch, frame, hangingFetch, json, sse } from "./helpers.js";
 
 describe("parseFrame", () => {
@@ -274,6 +274,73 @@ describe("chatStream", () => {
     });
   });
 
+  it("CH-37a: 400 `inference request is invalid` → INVALID_REQUEST 且带体积提示（E-019）", async () => {
+    // 真实形状是 {"error":{"code":"400","message":"inference request is invalid"}}，
+    // 顶层没有 code —— 所以分类只能靠 message。
+    const fetchImpl = fakeFetch(
+      json(400, { error: { code: "400", message: "inference request is invalid", type: "invalid_request_error" } }),
+    );
+    await assert.rejects(chatStream("tok", { model: "m" }, () => {}, { fetchImpl }), (err: unknown) => {
+      if (!(err instanceof RaccoonError)) return false;
+      assert.equal(err.kind, "INVALID_REQUEST");
+      assert.equal(err.status, 400);
+      assert.ok(err.message.includes("请求体太大"), `message 应说明是体积问题，实际 ${err.message}`);
+      return true;
+    });
+  });
+
+  it("CH-37b: 小请求体 + 同一个 message → 不给体积提示（避免把参数错误说成太大）", async () => {
+    const fetchImpl = fakeFetch(json(400, { error: { message: "inference request is invalid" } }));
+    await assert.rejects(chatStream("tok", { model: "m" }, () => {}, { fetchImpl }), (err: unknown) => {
+      if (!(err instanceof RaccoonError)) return false;
+      // 请求体只有几十字节，远低于 3 MiB 的 90% —— 不该给出"减少图片"这种误导性建议。
+      assert.ok(!err.userText.includes("3 MiB"), `不该提体积上限，实际 ${err.userText}`);
+      assert.ok(err.userText.includes("参数"), `应退化成通用提示，实际 ${err.userText}`);
+      return true;
+    });
+  });
+
+  it("CH-37c: 400 `image download failed` → INVALID_REQUEST 且提示是「下载不到」（E-018）", async () => {
+    const fetchImpl = fakeFetch(json(400, { error: { message: "image download failed" } }));
+    await assert.rejects(chatStream("tok", { model: "m" }, () => {}, { fetchImpl }), (err: unknown) => {
+      if (!(err instanceof RaccoonError)) return false;
+      assert.equal(err.kind, "INVALID_REQUEST");
+      assert.ok(err.userText.includes("没能下载到"), `应说明是下载失败，实际 ${err.userText}`);
+      // 关键：不能写成"不支持图片"，那是 E-018 推翻的错误结论。
+      assert.ok(!err.userText.includes("不支持"), `不该说"不支持"，实际 ${err.userText}`);
+      return true;
+    });
+  });
+
+  it("CH-37d: 400 `invalid image base64 content` → 同样归到图片问题", async () => {
+    const fetchImpl = fakeFetch(json(400, { error: { message: "invalid image base64 content" } }));
+    await assert.rejects(chatStream("tok", { model: "m" }, () => {}, { fetchImpl }), (err: unknown) => {
+      return err instanceof RaccoonError && err.kind === "INVALID_REQUEST" && err.userText.includes("没能下载到");
+    });
+  });
+
+  it("CH-37e: 请求体按真实字节数报进 message（E-019 的 3 MiB 判定依据）", async () => {
+    const fetchImpl = fakeFetch(json(400, { error: { message: "inference request is invalid" } }));
+    const big = "x".repeat(3_000_000);
+    await assert.rejects(
+      chatStream("tok", { model: "m", messages: [{ role: "user", content: big }] }, () => {}, { fetchImpl }),
+      (err: unknown) => {
+        if (!(err instanceof RaccoonError)) return false;
+        assert.ok(/请求体太大（\d+ 字节/.test(err.message), `message 应含真实字节数，实际 ${err.message}`);
+        assert.ok(err.userText.includes("3 MiB"), "接近上限时应给出体积提示");
+        return true;
+      },
+    );
+  });
+
+  it("CH-37f: 只序列化一次请求体（body 与真实字节数用同一份字符串）", async () => {
+    const fetchImpl = fakeFetch(sse([`data: ${JSON.stringify({ choices: [{ delta: { content: "ok" } }] })}\n`]));
+    await chatStream("tok", { model: "m", messages: [{ role: "user", content: "hi" }] }, () => {}, { fetchImpl });
+    const sent = fetchImpl.calls[0]?.body ?? "";
+    assert.ok(sent.length > 0);
+    assert.equal(JSON.parse(sent).model, "m");
+  });
+
   it("CH-38: 500 → SERVER", async () => {
     const fetchImpl = fakeFetch(json(500, { message: "boom" }));
     await assert.rejects(chatStream("tok", { model: "m" }, () => {}, { fetchImpl }), (err: unknown) => {
@@ -320,5 +387,29 @@ describe("chatStream", () => {
     await assert.rejects(chatStream("tok", { model: "m" }, () => {}, { fetchImpl }), (err: unknown) => {
       return err instanceof RaccoonError && err.kind === "SERVER";
     });
+  });
+
+  it("CH-44: 401 的提示同时给出「打开官方客户端」与「重新扫码」两条路", async () => {
+    // 2026-11-11 之前只写"重新扫码"，对只读官方客户端凭据的用户（ADR-0008，从没扫过码）是错的引导。
+    const fetchImpl = fakeFetch(json(401, { code: 200001, message: "authorization_empty_error" }));
+    await assert.rejects(chatStream("tok", { model: "m" }, () => {}, { fetchImpl }), (err: unknown) => {
+      if (!(err instanceof RaccoonError)) return false;
+      assert.equal(err.kind, "AUTH");
+      assert.ok(err.userText.includes("官方客户端"), `应提到官方客户端这条路，实际 ${err.userText}`);
+      assert.ok(err.userText.includes("扫码"), `应提到扫码这条路，实际 ${err.userText}`);
+      return true;
+    });
+  });
+
+  it("CH-45: 所有内置文案都不含会被 classifyPiAiError 重新归类的字样", async () => {
+    // classifyPiAiError() 按文本正则分类（dsh-llm-pi-ai/lib/index.js:1465-1476）。
+    // 我们的中文文案里出现 401/403/429/5xx/timeout/rate limit 会被重新归类，
+    // 用户看到的错误类别就与真实原因不符。这条断言把整张 HINTS 表锁住。
+    const banned = [/\b(?:401|403)\b/, /\b429\b/, /\b5\d\d\b/, /\btime(?:d)?\s*out\b/i, /rate.?limit/i];
+    for (const [kind, text] of Object.entries(HINTS)) {
+      for (const re of banned) {
+        assert.ok(!re.test(text), `${kind} 的文案命中了 ${re}，会被重新归类：${text}`);
+      }
+    }
   });
 });

@@ -63,6 +63,17 @@ export interface RaccoonSettings {
    * 两套是**不同命名空间**，code 互相喂会失败（E-030）。见 `protocol/web-auth.ts` 的表。
    */
   qrProtocol: QrProtocol;
+  /**
+   * 号池开关（ADR-0010）。
+   *
+   * **默认 `false`。** 号池会自动**花掉**账号的积分 —— 这必须是用户
+   * 显式打开的动作，不能因为"机器上有凭据"就默认接管。
+   *
+   * 关掉时：完全走 ADR-0008 的老路径（桌面端凭据 → 扫码兜底），
+   * 池里的账号一个都不碰。**但签到/测试仍然可用** —— 开关只控制
+   * "插件要不要自己决定用哪个号"，不控制"你能不能操作自己的账号"。
+   */
+  poolEnabled: boolean;
 }
 
 /** 扫码协议。 */
@@ -104,6 +115,8 @@ export const DEFAULT_SETTINGS: RaccoonSettings = {
    * 而这条路的用户是用微信扫的，两种都能扫出来（页面是同一个 `/login/mp`）。
    */
   qrProtocol: "web",
+  /** 默认关。号池会花积分，见字段注释。 */
+  poolEnabled: false,
 };
 
 const AUTH_SOURCES: readonly AuthSource[] = ["auto", "desktop", "qr"];
@@ -158,6 +171,7 @@ export function normalizeSettings(input: unknown): RaccoonSettings {
     debugLog: bool(raw["debugLog"], DEFAULT_SETTINGS.debugLog),
     authSource: authSource(raw["authSource"]),
     qrProtocol: qrProtocol(raw["qrProtocol"]),
+    poolEnabled: bool(raw["poolEnabled"], DEFAULT_SETTINGS.poolEnabled),
   };
 }
 

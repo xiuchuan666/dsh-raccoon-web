@@ -38,7 +38,7 @@
      * 构建标记。必须与宿主 src/build.ts 的 BUILD 一致 ——
      * 不一致就说明浏览器加载的是缓存的旧脚本。
      */
-    var BUILD = '2026-11-06T15:35';
+    var BUILD = '2026-11-11T23:05';
 
     /** provider id。宿主用同一个值注册，这里只用来判断"当前选的是不是我"。 */
     var PROVIDER_ID = 'raccoon-web';
@@ -55,6 +55,7 @@
         pillDead: '小浣熊 · 登录已失效',
         pillQuota: '小浣熊 · {points} 积分',
         pillUnknown: '小浣熊',
+        pillOtherModel: '这是小浣熊账号的余额，与当前选的模型无关；切换模型不会改变这个数字。',
 
         pageTitle: '小浣熊',
         pageSubtitle: '直接使用官方客户端已登录的账号，或扫码接入 xiaohuanxiong.com。凭据只在本机读取，插件不代持、不共享、不上传。',
@@ -71,6 +72,7 @@
         loginCancel: '取消',
         loginOut: '退出登录',
         loginScanHint: '用微信扫描二维码，在手机上确认后这里会自动变成已登录。',
+        loginPoolBusy: '正在为账号池添加账号 —— 二维码在下面的「账号池」区域，扫完不会改变当前账号。',
         loginExpiresIn: '{seconds} 秒后失效',
         loginAccount: '账号',
         loginTokenKind: '令牌类型',
@@ -144,6 +146,36 @@
         probeUnknown: '看不出来',
         probeButton: '实测读图',
         probeHint: '用一张 3×3 纯红图片问颜色。目录里的识图标签实测会错，所以给一个手动核对的办法。',
+
+        poolTitle: '账号池',
+        poolHint: '每个账号有独立的设备标识，互不干扰。成员要显式勾选才会被拿去发请求。',
+        poolEnabledLabel: '自动换号',
+        poolEnabledHint: '打开后，一个账号额度用完或撞到限流就自动切到下一个。关掉只停止自动换号 —— 签到与测试仍然可用。',
+        poolEmpty: '池里还没有账号。扫码添加，或直接导入官方客户端已登录的那个。',
+        poolAddQr: '扫码添加',
+        poolAddDesktop: '导入客户端账号',
+        poolCheckin: '一键签到',
+        poolCheckinBusy: '签到中…',
+        poolTest: '测试',
+        poolTesting: '测试中…',
+        poolRemove: '移除',
+        poolRemoveConfirm: '确认移除',
+        poolStateUnknown: '未测',
+        poolStateOk: '可用',
+        poolStateLimited: '限流中',
+        poolStateEmpty: '额度用尽',
+        poolStateDead: '凭据失效',
+        poolStateFlaky: '暂时不可用',
+        poolActive: '当前使用',
+        poolCount: '{total} 个账号 · {enabled} 个启用',
+        poolDevice: '设备 {device}',
+        poolExpires: '凭据 {time} 到期',
+        poolCoolUntil: '冷却到 {time}',
+        poolCheckinAlready: '今日已签',
+        poolCheckinGranted: '已签到',
+        poolCheckinFailed: '签到失败',
+        poolAddHint: '新加进来的账号默认不启用，勾上才会被拿去发请求。',
+        poolImportOk: '已导入客户端账号。',
     };
 
     var en = {
@@ -153,6 +185,7 @@
         pillDead: 'Raccoon · session expired',
         pillQuota: 'Raccoon · {points} points',
         pillUnknown: 'Raccoon',
+        pillOtherModel: 'This is your Raccoon account balance; it does not depend on the model currently selected.',
 
         pageTitle: 'Raccoon',
         pageSubtitle: 'Uses the account already signed in on the official desktop app, or signs in to xiaohuanxiong.com by QR. Credentials are read on this machine only — never held, shared, or uploaded.',
@@ -169,6 +202,7 @@
         loginCancel: 'Cancel',
         loginOut: 'Sign out',
         loginScanHint: 'Scan with WeChat and confirm on your phone. This page updates by itself.',
+        loginPoolBusy: 'Adding an account to the pool — the QR code is in the Account pool section below. Scanning it will not change the current account.',
         loginExpiresIn: 'expires in {seconds}s',
         loginAccount: 'Account',
         loginTokenKind: 'Token kind',
@@ -242,6 +276,36 @@
         probeUnknown: 'Inconclusive',
         probeButton: 'Probe vision',
         probeHint: 'Asks a model to name the colour of a 3×3 solid red image. Catalog vision tags are known to be wrong, so there is a manual check.',
+
+        poolTitle: 'Account pool',
+        poolHint: 'Each account gets its own device identity, so they do not interfere. A member only serves requests once you tick it.',
+        poolEnabledLabel: 'Automatic failover',
+        poolEnabledHint: 'When on, running out of credit or hitting a rate limit switches to the next account. Turning it off only stops the switching — check-in and testing keep working.',
+        poolEmpty: 'The pool is empty. Add an account by QR, or import the one the desktop app is signed in with.',
+        poolAddQr: 'Add by QR',
+        poolAddDesktop: 'Import desktop account',
+        poolCheckin: 'Check in all',
+        poolCheckinBusy: 'Checking in…',
+        poolTest: 'Test',
+        poolTesting: 'Testing…',
+        poolRemove: 'Remove',
+        poolRemoveConfirm: 'Confirm',
+        poolStateUnknown: 'Untested',
+        poolStateOk: 'Usable',
+        poolStateLimited: 'Rate limited',
+        poolStateEmpty: 'Out of credit',
+        poolStateDead: 'Credential rejected',
+        poolStateFlaky: 'Temporarily failing',
+        poolActive: 'In use',
+        poolCount: '{total} accounts · {enabled} enabled',
+        poolDevice: 'device {device}',
+        poolExpires: 'credential expires {time}',
+        poolCoolUntil: 'cooling until {time}',
+        poolCheckinAlready: 'already done today',
+        poolCheckinGranted: 'granted',
+        poolCheckinFailed: 'failed',
+        poolAddHint: 'A newly added account starts disabled; tick it before it can serve requests.',
+        poolImportOk: 'Desktop account imported.',
     };
 
     // ---------------------------------------------------------------- 样式
@@ -327,6 +391,17 @@
         flexDirection: 'column',
         gap: '5px',
         fontSize: '12px',
+    };
+    /** 当前模型不是小浣熊时的弱化外观：仍然可读，但一眼看得出"不是正在用的那个"。 */
+    var pillButtonDimStyle = Object.assign({}, pillButtonStyle, { opacity: 0.72 });
+    var pillHintStyle = {
+        marginTop: '6px',
+        paddingTop: '6px',
+        borderTop: '1px solid var(--dsh-panel-border, rgba(128,128,128,0.2))',
+        fontSize: '11px',
+        opacity: 0.7,
+        lineHeight: 1.45,
+        maxWidth: '220px',
     };
     var qrBoxStyle = {
         display: 'flex',
@@ -435,6 +510,7 @@
     var lastError;
     var timer;
     var inflight = false;
+    var reloadWanted = false;
 
     function nextDelay() {
         var login = snapshot === undefined ? undefined : snapshot.login;
@@ -453,7 +529,15 @@
     }
 
     async function load() {
-        if (inflight) return;
+        // 已经在飞：**记下来**，等这一轮回来再补一次。
+        //
+        // 早先这里是直接 `return`，于是 `act()` 结尾的 `void load()` 有可能
+        // 正好撞上一次轮询而在飞 —— 那次刷新被静默丢掉，用户点完「测试」
+        // 或勾完开关后要等下一个 20 秒轮询才看到变化，看起来像按钮没生效。
+        if (inflight) {
+            reloadWanted = true;
+            return;
+        }
         inflight = true;
         try {
             var response = await fetch(STATUS_PATH, { headers: { accept: 'application/json' } });
@@ -470,6 +554,11 @@
             inflight = false;
         }
         notify();
+        if (reloadWanted) {
+            reloadWanted = false;
+            void load();
+            return;
+        }
         scheduleNext();
     }
 
@@ -574,7 +663,13 @@
 
     // ---------------------------------------------------------------- 组件
 
-    /** 药丸。输入框左边那一条，跟模型选择器同一行。 */
+    /**
+     * 药丸。输入框左边那一条，跟模型选择器同一行。
+     *
+     * 显示的是**小浣熊账号的余额**，与当前选的是哪个模型无关。当前模型不是
+     * 小浣熊时，展开详情里多一行提示 —— 说明"这个数字不会因为你用别的模型
+     * 而变化"，而不是把整个药丸藏起来（那样用户会以为插件坏了）。
+     */
     function CreditPill(props) {
         var statusPair = useStatus();
         var status = statusPair[0];
@@ -583,6 +678,8 @@
         var open = openState[0];
         var setOpen = openState[1];
         var t = props.t;
+        var selectedProvider = props.selectedProvider;
+        var isCurrent = selectedProvider === undefined || selectedProvider === PROVIDER_ID;
 
         var label;
         var detail = null;
@@ -607,13 +704,14 @@
                 h('div', { style: rowStyle }, h('span', null, t('quotaDaily')), h('span', null, points(quota.daily))),
                 h('div', { style: rowStyle },
                     h('span', null, t('providerTitle')),
-                    h('span', { style: dimStyle }, publishText(t, status.publish))));
+                    h('span', { style: dimStyle }, publishText(t, status.publish))),
+                isCurrent ? null : h('div', { style: pillHintStyle }, t('pillOtherModel')));
         }
 
         return h('div', { style: pillWrapStyle, 'data-raccoon-pill': true },
             h('button', {
                 type: 'button',
-                style: pillButtonStyle,
+                style: isCurrent ? pillButtonStyle : pillButtonDimStyle,
                 title: t('title'),
                 onClick: function () { setOpen(!open); },
             }, label),
@@ -623,21 +721,30 @@
     /**
      * 药丸的开关。
      *
-     * 只在"当前选的是小浣熊"时显示余额 —— 显示别的 provider 的余额是
-     * 误导。拿不到选择状态（宿主没提供 projection）时还是显示：
-     * "不知道"不该把可能是真的信息藏起来。
+     * ## 2026-11-11 改了主意：现在**总是显示**
+     *
+     * 原来只在"当前模型选的是小浣熊"时显示，理由是"显示别的 provider 的余额是
+     * 误导"。这个理由本身没错，但它带来一个更糟的后果：用户的默认模型是
+     * `workbuddy-global`（见 profile 的 `agent-default-model`），于是药丸永远
+     * 不出现 —— 用户看到的是"插件坏了，积分不显示"，而不是"你没选小浣熊"。
+     *
+     * 判断"误导"的代价不该是"完全看不到自己的余额"。余额是小浣熊账号的资产，
+     * 与当前选哪个模型无关；点开药丸的详情里本来就写着 `providerTitle`，
+     * 想确认归属的人一眼就能看到。
+     *
+     * 所以这里保留 `useProjection` 的读取（它还能告诉我们选中的是哪个），但
+     * 只用它来**标注**，不再用它来决定显不显示。
      */
     function CreditPillGate(props) {
-        var projection;
+        var selectedProvider;
         try {
-            projection = props.useProjection === undefined ? undefined : props.useProjection('modelSelection');
+            var projection = props.useProjection === undefined ? undefined : props.useProjection('modelSelection');
+            var selected = projection === undefined ? undefined : (projection.next || projection.lastUsed);
+            selectedProvider = selected === undefined || selected === null ? undefined : selected.provider;
         } catch (error) {
-            projection = undefined;
+            selectedProvider = undefined;
         }
-        var selected = projection === undefined ? undefined : (projection.next || projection.lastUsed);
-        var provider = selected === undefined ? undefined : selected.provider;
-        if (provider !== undefined && provider !== PROVIDER_ID) return null;
-        return h(CreditPill, props);
+        return h(CreditPill, Object.assign({}, props, { selectedProvider: selectedProvider }));
     }
 
     function publishText(t, state) {
@@ -738,18 +845,24 @@
                     : null,
                 entryButtons());
         } else if (phase === 'pending' || phase === 'logging') {
+            // 这一轮扫码可能是「账号池」发起的（两个区共用一个 LoginFlow）。
+            // 那种情况下二维码属于下面那个区，这里只说明一句，不重复显示 ——
+            // 否则用户会以为上面这张是"换当前账号"的码，扫完却发现账号没变。
+            var pendingIsPool = login !== undefined && login.mode === 'pool';
             body = h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
                 h('div', { style: rowStyle },
                     h('span', { style: { fontWeight: 600 } }, t(phase === 'logging' ? 'loginLogging' : 'loginPending')),
                     h('span', { style: dimStyle }, t('loginExpiresIn', { seconds: seconds }))),
-                login.qrSvg === undefined
-                    ? h('div', { style: dimStyle }, t('loginScanHint'))
-                    : h('div', { style: qrBoxStyle },
-                        h('div', {
-                            style: { width: '168px', height: '168px', lineHeight: 0 },
-                            dangerouslySetInnerHTML: { __html: login.qrSvg },
-                        }),
-                        h('div', { style: Object.assign({}, dimStyle, { fontSize: '11.5px', textAlign: 'center' }) }, t('loginScanHint'))),
+                pendingIsPool
+                    ? h('div', { style: Object.assign({}, dimStyle, { fontSize: '12px' }) }, t('loginPoolBusy'))
+                    : login.qrSvg === undefined
+                        ? h('div', { style: dimStyle }, t('loginScanHint'))
+                        : h('div', { style: qrBoxStyle },
+                            h('div', {
+                                style: { width: '168px', height: '168px', lineHeight: 0 },
+                                dangerouslySetInnerHTML: { __html: login.qrSvg },
+                            }),
+                            h('div', { style: Object.assign({}, dimStyle, { fontSize: '11.5px', textAlign: 'center' }) }, t('loginScanHint'))),
                 h('div', { style: { display: 'flex', gap: '8px' } },
                     h('button', {
                         type: 'button',
@@ -1000,6 +1113,214 @@
                 : h('div', { style: { color: 'var(--dsh-danger, #d64545)', fontSize: '11.5px' } }, message)));
     }
 
+    /**
+     * 账号池。
+     *
+     * 三个约束来自 ADR-0010，改这里之前先读它：
+     * 1. 开关只控制"插件要不要自己决定用谁"，不控制"你能不能操作" —— 所以
+     *    关掉自动换号时，签到与测试按钮仍然可用（workbuddy 曾把按钮挂在开关上，
+     *    结果关掉后再也没法签到）。
+     * 2. 勾选是即时生效的写操作，失败要回滚显示 —— 界面的真相是宿主报的状态，
+     *    不是这次请求的返回值（`act()` 无论成败都会 `load()`）。
+     * 3. 删除做两段式，不用 `window.confirm` —— 有些宿主会拦原生对话框，
+     *    拦了之后按钮就彻底没反应了。
+     */
+    function PoolSection(props) {
+        var t = props.t;
+        var status = props.status;
+        var pool = status.pool || {};
+        var accounts = Array.isArray(pool.accounts) ? pool.accounts : [];
+        var settings = status.settings || {};
+        var busyState = React.useState('');
+        var busy = busyState[0];
+        var setBusy = busyState[1];
+        var confirmState = React.useState('');
+        var confirming = confirmState[0];
+        var setConfirming = confirmState[1];
+        var messageState = React.useState(undefined);
+        var message = messageState[0];
+        var setMessage = messageState[1];
+        // 扫码加号时的二维码。**不复用上面那个登录块** —— 那是"当前账号"的
+        // 登录入口，而这里加的是池成员；两者相位不同（ADR-0010 §4），
+        // 混在一起会让用户以为加号会顶掉当前账号。
+        var qrState = React.useState(undefined);
+        var pendingQr = qrState[0];
+        var setPendingQr = qrState[1];
+
+        // 二维码要跟着宿主的状态走，不能停在点按钮那一刻的快照 ——
+        // 用户盯着看的是"还剩多少秒"和"扫了没有"，而这两件事只有宿主知道。
+        //
+        // 还必须认领 `login.mode === 'pool'`：设置卡的「登录」区和这里的
+        // 「账号池」区共用同一个 LoginFlow。用户在登录区点一次扫码，会把
+        // 这里正在等的池二维码取消掉（`start()` 先 cancel 再取码），此时
+        // 相位仍是 pending —— 只看相位的话这里会继续显示一张已经属于主登录
+        // 的二维码，用户扫完 token 写进 token.json 而不是池里。
+        var login = status.login || {};
+        var scanning = pendingQr !== undefined
+            && login.mode === 'pool'
+            && (login.phase === 'pending' || login.phase === 'logging');
+        React.useEffect(function () {
+            if (pendingQr === undefined) return;
+            if (login.mode === 'pool' && (login.phase === 'pending' || login.phase === 'logging')) return;
+            // 这一轮结束了（扫成功、过期、被取消），或者被主登录抢走了 —— 收起二维码。
+            setPendingQr(undefined);
+        }, [login.phase, login.mode]);
+
+        function run(action, body, note) {
+            setMessage(undefined);
+            setBusy(action + (body !== undefined && body.id !== undefined ? ':' + body.id : ''));
+            void act(action, body).then(function (result) {
+                setBusy('');
+                if (result === undefined) return;
+                if (result.ok === false) {
+                    setPendingQr(undefined);
+                    setMessage(result.error === undefined ? t('errAction', { message: 'unknown' }) : String(result.error));
+                    return;
+                }
+                if (action === 'pool-add-start') {
+                    setPendingQr(result.login === undefined ? undefined : result.login);
+                }
+                if (note !== undefined) setMessage(note);
+            });
+        }
+
+        function toggleAccount(account, next) {
+            // 乐观更新不做：`act()` 结束会拉一次 status，闪烁一次比"显示成功但没生效"好。
+            run('pool-toggle', { id: account.id, enabled: next });
+        }
+
+        function removeAccount(account) {
+            if (confirming !== account.id) {
+                setConfirming(account.id);
+                return;
+            }
+            setConfirming('');
+            run('pool-remove', { id: account.id });
+        }
+
+        function stateText(measure) {
+            if (measure === undefined) return t('poolStateUnknown');
+            if (measure.state === 'ok') return t('poolStateOk');
+            if (measure.state === 'limited') return t('poolStateLimited');
+            if (measure.state === 'empty') return t('poolStateEmpty');
+            if (measure.state === 'dead') return t('poolStateDead');
+            return t('poolStateFlaky');
+        }
+
+        function stateColor(measure) {
+            if (measure === undefined) return 'var(--dsh-text-secondary, #6b7280)';
+            if (measure.state === 'ok') return 'var(--dsh-success, #2f9e44)';
+            if (measure.state === 'dead') return 'var(--dsh-danger, #d64545)';
+            return 'var(--dsh-warning, #e08c00)';
+        }
+
+        function accountCard(account) {
+            var measure = account.measure;
+            var cooling = measure !== undefined && measure.until !== undefined && measure.until > Date.now();
+            var lines = [];
+            lines.push(h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+                h('input', {
+                    type: 'checkbox',
+                    checked: account.enabled === true,
+                    disabled: busy !== '',
+                    onChange: function (event) { toggleAccount(account, event.target.checked); },
+                }),
+                h('span', { style: { fontWeight: 600, fontFamily: 'ui-monospace, monospace', fontSize: '12px' } }, account.id.slice(0, 8)),
+                account.active === true
+                    ? h('span', { style: { fontSize: '11px', padding: '1px 6px', borderRadius: '999px', border: '1px solid var(--dsh-accent, #4b7bec)', color: 'var(--dsh-accent, #4b7bec)' } }, t('poolActive'))
+                    : null,
+                h('span', { style: { marginLeft: 'auto', fontSize: '11.5px', color: stateColor(measure) } }, stateText(measure))));
+            lines.push(h('div', { style: Object.assign({}, dimStyle, { fontSize: '11px', display: 'flex', flexWrap: 'wrap', gap: '10px' }) },
+                h('span', null, account.principal === undefined ? '—' : account.principal),
+                h('span', null, t('poolDevice', { device: account.device === undefined ? '—' : account.device })),
+                account.expiresAt === undefined ? null : h('span', null, t('poolExpires', { time: clockOf(account.expiresAt) })),
+                cooling ? h('span', { style: { color: 'var(--dsh-warning, #e08c00)' } }, t('poolCoolUntil', { time: clockOf(measure.until) })) : null));
+            if (measure !== undefined && measure.note !== undefined) {
+                lines.push(h('div', { style: Object.assign({}, dimStyle, { fontSize: '11px' }) }, measure.note));
+            }
+            lines.push(h('div', { style: { display: 'flex', gap: '8px', marginTop: '2px' } },
+                h('button', {
+                    type: 'button',
+                    style: buttonStyle,
+                    disabled: busy !== '',
+                    onClick: function () { run('pool-test', { id: account.id }); },
+                }, busy === 'pool-test:' + account.id ? t('poolTesting') : t('poolTest')),
+                h('button', {
+                    type: 'button',
+                    style: confirming === account.id
+                        ? Object.assign({}, buttonStyle, { borderColor: 'var(--dsh-danger, #d64545)', color: 'var(--dsh-danger, #d64545)' })
+                        : buttonStyle,
+                    disabled: busy !== '',
+                    onClick: function () { removeAccount(account); },
+                }, confirming === account.id ? t('poolRemoveConfirm') : t('poolRemove'))));
+            return h('div', {
+                style: {
+                    border: '1px solid var(--dsh-panel-border, rgba(128,128,128,0.2))',
+                    borderRadius: '8px',
+                    padding: '9px 11px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '6px',
+                    'data-raccoon-account': account.id,
+                },
+            }, lines);
+        }
+
+        var header = h('div', { style: rowStyle },
+            h('span', null, t('poolCount', { total: pool.total === undefined ? 0 : pool.total, enabled: pool.enabledCount === undefined ? 0 : pool.enabledCount })),
+            h('span', { style: Object.assign({}, dimStyle, { fontSize: '11.5px' }) },
+                busy === 'pool-checkin' ? t('poolCheckinBusy') : ''));
+
+        return section(t('poolTitle'), h('div', { style: { display: 'flex', flexDirection: 'column', gap: '9px' } },
+            h('div', null,
+                h(Switch, {
+                    t: t,
+                    label: t('poolEnabledLabel'),
+                    checked: settings.poolEnabled === true,
+                    onChange: function (next) { run('set-setting', { key: 'poolEnabled', value: next }); },
+                }),
+                h('div', { style: Object.assign({}, dimStyle, { fontSize: '11.5px', marginLeft: '22px' }) }, t('poolEnabledHint'))),
+            h('div', { style: Object.assign({}, dimStyle, { fontSize: '11.5px' }) }, t('poolHint')),
+            header,
+            accounts.length === 0
+                ? h('div', { style: Object.assign({}, dimStyle, { fontSize: '12px' }) }, t('poolEmpty'))
+                : h('div', { style: { display: 'flex', flexDirection: 'column', gap: '7px' } }, accounts.map(accountCard)),
+            pool.note === undefined
+                ? null
+                : h('div', { style: Object.assign({}, dimStyle, { fontSize: '11.5px' }) }, pool.note),
+            h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } },
+                h('button', {
+                    type: 'button',
+                    style: buttonStyle,
+                    disabled: busy !== '',
+                    onClick: function () { run('pool-add-start'); },
+                }, t('poolAddQr')),
+                h('button', {
+                    type: 'button',
+                    style: buttonStyle,
+                    disabled: busy !== '',
+                    onClick: function () { run('pool-import-desktop', undefined, t('poolImportOk')); },
+                }, t('poolAddDesktop')),
+                h('button', {
+                    type: 'button',
+                    style: buttonPrimaryStyle,
+                    disabled: busy !== '' || accounts.length === 0,
+                    onClick: function () { run('pool-checkin'); },
+                }, busy === 'pool-checkin' ? t('poolCheckinBusy') : t('poolCheckin'))),
+            h('div', { style: Object.assign({}, dimStyle, { fontSize: '11px' }) }, t('poolAddHint')),
+            scanning && login.qrSvg !== undefined
+                ? h('div', { style: qrBoxStyle },
+                    h('div', {
+                        style: { width: '168px', height: '168px', lineHeight: 0 },
+                        dangerouslySetInnerHTML: { __html: login.qrSvg },
+                    }),
+                    h('div', { style: Object.assign({}, dimStyle, { fontSize: '11.5px', textAlign: 'center' }) }, t('loginScanHint')))
+                : null,
+            message === undefined
+                ? null
+                : h('div', { style: { color: 'var(--dsh-danger, #d64545)', fontSize: '11.5px' } }, message)));
+    }
+
     function DiagnosticsSection(props) {
         var t = props.t;
         var status = props.status;
@@ -1054,6 +1375,7 @@
                 status.catalogReady ? null : h('div', { style: Object.assign({}, dimStyle, { fontSize: '11.5px' }) }, t('modelsEmpty')))),
             QuotaSection({ t: t, status: status }),
             ModelsSection({ t: t, status: status }),
+            PoolSection({ t: t, status: status }),
             SettingsSection({ t: t, status: status }),
             DiagnosticsSection({ t: t, status: status }),
             error === undefined
@@ -1074,6 +1396,39 @@
     var React = undefined;
     var h = undefined;
 
+    /**
+     * 拿翻译函数，拿不到也不抛。
+     *
+     * 正常路径是 `ctx.locale.bind(NAMESPACE)`。但在 `locale` 服务缺席、或它的
+     * `bind` 因为任何原因不可用时，整个 apply 不能因此崩掉 —— 界面用 key 当
+     * 文案（`t('title') === 'title'`）虽然难看，但比"设置页一片空白"强。
+     */
+    function bindTranslator(ctx) {
+        try {
+            if (ctx.locale !== undefined && typeof ctx.locale.bind === 'function') {
+                var bound = ctx.locale.bind(NAMESPACE);
+                if (typeof bound === 'function') return bound;
+            }
+        } catch (error) {
+            console.warn('[' + BUNDLE_NAME + '] locale bind failed, falling back to raw keys:', error);
+        }
+        return function fallbackTranslate(key) { return key; };
+    }
+
+    /**
+     * 把一步 slot 注册单独兜住。
+     *
+     * 一个 slot 挂不上（宿主没声明它、注册被守卫拒、组件形态不被接受）不该
+     * 连累另外两个。错误照旧打到 console，排障时还能看见。
+     */
+    function guard(label, step) {
+        try {
+            step();
+        } catch (error) {
+            console.error('[' + BUNDLE_NAME + '] slot "' + label + '" failed to register:', error);
+        }
+    }
+
     var loader = globalThis.__ModuleLoader__;
     if (loader === undefined) {
         // 宿主没有模块加载器：说明这个脚本被当普通页面脚本执行了。
@@ -1090,52 +1445,75 @@
             return {
                 inject: ['slots', 'locale'],
                 apply: function apply(ctx) {
-                    ctx.effect(function () {
-                        return ctx.locale.register(NAMESPACE, { zh: zh, en: en });
-                    }, BUNDLE_NAME + ': locale');
-
-                    var t = ctx.locale.bind(NAMESPACE);
-
-                    // 输入框左侧：余额药丸。order 4 与 minimaxcode 一致 ——
-                    // 两个插件的药丸不该互相挤位置。
-                    ctx.slots.inject('conversation.input.left', function () {
-                        return ctx.slots.register({
-                            name: 'conversation.input.left',
-                            id: 'raccoon-credits',
-                            order: 4,
-                            locale: NAMESPACE,
-                            inject: function () { return { t: t }; },
-                        }, CreditPillGate);
-                    });
-
-                    // 插件自己的设置页。key 必须是包名。
-                    ctx.slots.inject('plugins.bundle.config', function () {
-                        return ctx.slots.register({
-                            name: 'plugins.bundle.config',
-                            key: BUNDLE_NAME,
-                            locale: NAMESPACE,
-                            inject: function () { return { t: t }; },
-                        }, PluginPage);
-                    });
-
-                    // 设置对话框左侧菜单。设置页走的是 `settings.section`（kind=list,
-                    // scope=root），与 `plugins.bundle.config` 不是同一个界面 ——
-                    // 之前只注册了后者，所以「设置里找不到入口」（2026-11-06 实测）。
-                    // 同款写法见 profile 里的 dsh-better-sidebar（截图中的「侧边卡片」）。
+                    // ── 为什么每一步都单独 try/catch ───────────────────────────
+                    // DSH 0.2.2 的 `locale.register()` 在**同一 namespace 的同一
+                    // locale 已存在时抛错**：
+                    //   `locale namespace "x" already has locale "zh"`
+                    // 而 `apply` 一旦抛错，它后面所有的 `slots.inject(...)` 全都不
+                    // 执行 —— 表现为"积分药丸消失 + 设置页空白"同时出现，看起来
+                    // 像两个 bug，其实是一个。
                     //
-                    // 用一层包装组件闭包捕获 t，不依赖内核把 inject 返回值合成 props 的
-                    // 具体方式；同时透传 sectionProps，让宿主给的 close 等不丢。
-                    ctx.slots.inject('settings.section', function () {
-                        var RaccoonSettingsSection = function (sectionProps) {
-                            return h(PluginPage, Object.assign({}, sectionProps, { t: t }));
-                        };
-                        return ctx.slots.register({
-                            name: 'settings.section',
-                            id: BUNDLE_NAME,
-                            order: 95,
-                            label: function () { return t('title'); },
-                            locale: NAMESPACE,
-                        }, RaccoonSettingsSection);
+                    // 触发条件很现实：profile 里同一个包被加载两次（重复 insert，
+                    // 用户手工清理插件时很容易留下），两次 apply 跑同一个闭包，
+                    // 第二次就炸。所以这里的每一步都必须自己兜住自己的错，
+                    // 任何一步失败都不能连累其它两步。
+                    var t = bindTranslator(ctx);
+
+                    // 1) 语言包。重复注册是可恢复的（旧的还在，翻译照样能用）。
+                    try {
+                        ctx.effect(function () {
+                            return ctx.locale.register(NAMESPACE, { zh: zh, en: en });
+                        }, BUNDLE_NAME + ': locale');
+                    } catch (error) {
+                        console.warn('[' + BUNDLE_NAME + '] locale registration skipped:', error);
+                    }
+
+                    // 2) 输入框左侧：余额药丸。order 4 与 minimaxcode 一致 ——
+                    //    两个插件的药丸不该互相挤位置。
+                    guard('conversation.input.left', function () {
+                        ctx.slots.inject('conversation.input.left', function () {
+                            return ctx.slots.register({
+                                name: 'conversation.input.left',
+                                id: 'raccoon-credits',
+                                order: 4,
+                                locale: NAMESPACE,
+                                inject: function () { return { t: t }; },
+                            }, CreditPillGate);
+                        });
+                    });
+
+                    // 3) 插件自己的设置页（「插件」面板 → 包详情）。key 必须是包名。
+                    guard('plugins.bundle.config', function () {
+                        ctx.slots.inject('plugins.bundle.config', function () {
+                            return ctx.slots.register({
+                                name: 'plugins.bundle.config',
+                                key: BUNDLE_NAME,
+                                locale: NAMESPACE,
+                                inject: function () { return { t: t }; },
+                            }, PluginPage);
+                        });
+                    });
+
+                    // 4) 设置对话框左侧菜单。设置页走的是 `settings.section`
+                    //    （kind=list, scope=root），与 `plugins.bundle.config` 不是
+                    //    同一个界面 —— 之前只注册了后者，所以「设置里找不到入口」
+                    //    （2026-11-06 实测）。同款写法见 dsh-better-sidebar。
+                    //
+                    //    用一层包装组件闭包捕获 t，不依赖内核把 inject 返回值合成
+                    //    props 的具体方式；同时透传 sectionProps，让宿主给的 close 等不丢。
+                    guard('settings.section', function () {
+                        ctx.slots.inject('settings.section', function () {
+                            var RaccoonSettingsSection = function (sectionProps) {
+                                return h(PluginPage, Object.assign({}, sectionProps, { t: t }));
+                            };
+                            return ctx.slots.register({
+                                name: 'settings.section',
+                                id: BUNDLE_NAME,
+                                order: 95,
+                                label: function () { return t('title'); },
+                                locale: NAMESPACE,
+                            }, RaccoonSettingsSection);
+                        });
                     });
                 },
             };

@@ -15,9 +15,12 @@
     "revive": "node scripts/revive.mjs",
     "verify": "node scripts/verify-install.mjs",
     "log": "node scripts/devlog.mjs",
-    "smoke": "node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scripts/smoke-host.mjs && node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scripts/smoke-provider.mjs",
+    "smoke": "node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scripts/smoke-host.mjs && node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scripts/smoke-provider.mjs && node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scripts/smoke-pool.mjs",
+    "smoke:pool": "node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scripts/smoke-pool.mjs",
     "smoke:live": "node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scripts/smoke-desktop-auth.mjs",
     "smoke:chat": "node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scripts/smoke-chat-live.mjs",
+    "smoke:client": "node scripts/smoke-client-apply.mjs",
+    "smoke:client:twice": "node scripts/smoke-client-apply.mjs --twice",
     "build": "pnpm --filter dsh-raccoon-web run build",
     "typecheck": "pnpm --filter dsh-raccoon-web run typecheck",
     "test": "node --experimental-strip-types --import ./scripts/test-resolve-register.mjs --test \"packages/dsh-raccoon-web/test/*.test.ts\""

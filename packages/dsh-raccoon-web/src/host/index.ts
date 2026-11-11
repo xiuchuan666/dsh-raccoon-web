@@ -21,7 +21,7 @@
 import type { LlmRegistrar } from "./publish.js";
 import type { Logger } from "./log.js";
 import type { AuthSource, SettingsHandle } from "./settings.js";
-import type { StatusDesktopAuth, StatusModel, StatusQuota, StatusSnapshot } from "./status.js";
+import type { StatusDesktopAuth, StatusModel, StatusPool, StatusPoolAccount, StatusQuota, StatusSnapshot } from "./status.js";
 import type { ActionResult, WebServerLike } from "./routes.js";
 
 import { buildDiagnostics } from "./status.js";
@@ -29,14 +29,25 @@ import { loginBlock, registerRoutes } from "./routes.js";
 import { createTtlCache } from "./cache.js";
 import { LoginFlow } from "./login-flow.js";
 import { tokenTag } from "./log.js";
-import { Publisher, rosterSignature } from "./publish.js";
+import { Publisher, rosterSignature, type PublishAccountResolver } from "./publish.js";
 import { PROBE_PNG_BASE64 } from "./solid-png.js";
 import { clearToken, readProbes, readToken, recordProbe, saveToken, type StoredToken } from "./store.js";
+import {
+  classifyMeasure,
+  isCooling,
+  readPool,
+  shouldPersistMeasure,
+  sortForUse,
+  upsertAccount,
+  writePool,
+  type PoolAccount,
+  type PoolQuota,
+} from "./pool.js";
 import { toDescriptors, type ModelDescriptor } from "../provider/roster.js";
 import { FALLBACK_MODELS } from "../provider/fallback-roster.js";
 import { fetchCatalog, flattenCatalog } from "../protocol/catalog.js";
 import { readDesktopAuth, type DesktopAuth } from "../protocol/desktop-auth.js";
-import { fetchBalance, fetchBills, todayGranted } from "../protocol/points.js";
+import { fetchBalance, fetchBills, grantDaily, todayGranted } from "../protocol/points.js";
 import { applyThinking, chatStream, sessionIdFor } from "../protocol/chat.js";
 import { renderQrSvg } from "../protocol/qr.js";
 import { CATALOG_TTL_MS, DEFAULT_CONTEXT_CAP, PROVIDER_ID, QUOTA_TTL_MS } from "../protocol/consts.js";
@@ -124,6 +135,18 @@ export class RaccoonHost {
    * 恢复方式：改设置里的来源、或重启插件（或点"重新读取客户端登录态"）。
    */
   private desktopIgnored = false;
+  /**
+   * 号池（ADR-0010）。
+   *
+   * 空数组 ≠ "没有号池"：`accounts` 是**用户显式勾选过的成员**，池空就是不换号。
+   * 与 `poolEnabled` 是两件事 —— 关掉开关只停止自动换号，账号列表与签到/测试
+   * 仍然可用（workbuddy 把按钮挂在开关上，导致关掉后再也没法签到）。
+   */
+  private accounts: PoolAccount[] = [];
+  /** 号池成员最近一次的余额读数。**不落盘**：它是测量，不是配置。 */
+  private poolQuota = new Map<string, PoolQuota>();
+  /** 当前在服务的池成员 id。`poolEnabled` 关掉时恒 undefined。 */
+  private poolActiveId: string | undefined;
   private probes = new Map<string, boolean>();
   private catalog: CatalogState = { models: [], descriptors: [], ready: false };
   private quota: StatusQuota = {
@@ -152,7 +175,12 @@ export class RaccoonHost {
       logger: options.logger,
       renderQr: (content) => renderQrSvg(content),
       qrProtocol: () => options.settings.get().qrProtocol,
-      onReady: async (token) => {
+      onReady: async (token, mode) => {
+        // 号池模式：只加成员，不碰"当前账号"（ADR-0010 §4）。
+        if (mode === "pool") {
+          await this.addPoolAccount(token, "qr");
+          return;
+        }
         // 扫码拿到的 token 会覆盖桌面端凭据：用户刚刚明确选择了"用这个账号"。
         this.storedToken = token;
         this.token = token;
@@ -186,13 +214,19 @@ export class RaccoonHost {
     try {
       this.storedToken = await readToken();
       this.probes = await this.readProbesSafely();
+      // 号池在 token 解析之前读：`resolveToken()` 之后要决定"这次谁服务"，
+      // 而号池里的活跃成员可能压根不是 `token.json` 那个账号。
+      this.accounts = await readPool().catch(() => []);
       await this.resolveToken("bootstrap");
       // 先同步一次发布器。**没有 token 时它不会注册 provider**（三元门控，
       // 见 docs/02-design/01-module-map.md 的 createPublisher）：注册了也调不通，
       // 只会让用户在模型选择器里选到一个必然报错的项。用户先在插件页扫码，
       // 登录完成时 `onReady` 会再调一次，那时才真正注册。
       this.syncPublisher();
-      if (this.token !== undefined) {
+      // 判据是 `activeToken()` 而不是 `this.token`：号池开着的时候真正在服务的
+      // 是池成员，`this.token`（当前账号）可能恰好是空的 —— 那种情况下
+      // 用 `this.token` 判会让首屏永远是"目录未就绪 / 余额未知"。
+      if (this.activeToken() !== undefined) {
         await this.refreshCatalog({ force: false });
         // 余额也在这里拉一次，而且 **await**。
         // 之前在 `snapshot()` 里 `void refreshQuota()` 火后不管，导致用户第一次
@@ -316,10 +350,15 @@ export class RaccoonHost {
   // ------------------------------------------------------------------ actions
 
   /**
-   * 八个 action 的入口。
+   * 全部 action 的唯一入口。
    *
+   * 十六个 `case`、十四个 action 名（`set-setting` 与 `set-enabled` 同体）。
    * 任何一个 action 都不该让宿主进程崩 —— 全部包在 try 里，错误变成
    * `{ok:false, error}`。UI 直接把 error 显示出来。
+   *
+   * **新增 action 必须同时改三处**：这里的 switch、`client.js` 里发起它的按钮、
+   * 以及 `docs/02-design/07-account-pool.md` §5 的动作表 —— 少改一处就会留下
+   * "界面上有按钮但宿主不认"或"宿主支持但没人调"的死代码。
    */
   async runAction(action: string, body: Record<string, unknown>): Promise<ActionResult> {
     try {
@@ -338,7 +377,17 @@ export class RaccoonHost {
         case "refresh-catalog": {
           // 未登录时点"刷新"要有明确答复。静默返回空列表会让用户以为
           // 目录真的空了 —— 而真实原因是"还没登录"。
-          if (this.token === undefined) return { ok: false, error: "未登录小浣熊，请先扫码。" };
+          //
+          // 判据必须是 `activeToken()` 而不是 `this.token`：号池开着的时候
+          // 真正在服务的可能是池里的号，而 `this.token`（当前账号）可能恰好
+          // 是空的（比如只导入过池成员、没扫过码）。用 `this.token` 判会让
+          // 这种用户点"刷新"得到"未登录"—— 但他明明能用。
+          if (this.activeToken() === undefined) {
+            return {
+              ok: false,
+              error: "未登录小浣熊：装过官方客户端的话打开它登录即可；没有客户端就扫码登录。",
+            };
+          }
           await this.refreshCatalog({ force: true });
           // **必须重新发布一次名册。** 目录变了（上游上下线模型、或 contextCap
           // 改了导致 contextWindow/maxTokens 重算），`this.catalog.descriptors`
@@ -357,6 +406,18 @@ export class RaccoonHost {
           return { ok: true, quota: this.quota };
         case "probe-vision":
           return await this.actionProbeVision(body);
+        case "pool-add-start":
+          return await this.actionPoolAddStart();
+        case "pool-import-desktop":
+          return await this.actionPoolImportDesktop();
+        case "pool-toggle":
+          return await this.actionPoolToggle(body);
+        case "pool-remove":
+          return await this.actionPoolRemove(body);
+        case "pool-checkin":
+          return await this.actionPoolCheckin();
+        case "pool-test":
+          return await this.actionPoolTest(body);
         case "set-setting":
         case "set-enabled":
           return await this.actionSetSetting(action, body);
@@ -402,7 +463,9 @@ export class RaccoonHost {
   private async actionRefreshAuth(): Promise<ActionResult> {
     this.desktopIgnored = false;
     await this.resolveToken("refresh-auth");
-    if (this.token === undefined) {
+    // 同 `refresh-catalog`：号池里可能有可用成员，而当前账号是空的。
+    // 只看 `this.token` 会让"只用号池"的用户被判成未登录。
+    if (this.activeToken() === undefined) {
       this.publisher.dispose("not-configured");
       return {
         ok: false,
@@ -434,7 +497,9 @@ export class RaccoonHost {
     const modelId = typeof body["model"] === "string" ? body["model"] : "";
     if (modelId.length === 0) return { ok: false, error: "缺少 model 参数" };
 
-    const token = this.token?.token;
+    // 与其它发请求的路径一致：号池开着时该用池成员探，而不是当前账号。
+    // 探图要花一次真实对话额度，用错号会让用户以为"这个号支持/不支持"。
+    const token = this.activeToken();
     if (token === undefined) return { ok: false, error: "未登录小浣熊" };
 
     const requestBody: Record<string, unknown> = {
@@ -477,6 +542,12 @@ export class RaccoonHost {
     const next = this.options.settings.get();
     this.logger.setDebug(next.debugLog);
     if (key === "enabled" || key === "reasoning") this.syncPublisher();
+    // 号池开关直接影响"谁服务 + 带哪个设备身份"，必须重新发布名册。
+    // 关掉时要立刻退回当前账号，否则用户关了开关发现还在用池里的号。
+    if (key === "poolEnabled") {
+      this.poolActiveId = undefined;
+      this.syncPublisher();
+    }
     // 改来源等于换了一套"去哪找 token"的规则，必须重跑一遍解析：
     // 从 qr 切到 desktop 时要读文件，从 desktop 切到 qr 时要把桌面端 token 放下。
     if (key === "authSource") return await this.actionRefreshAuth();
@@ -492,7 +563,7 @@ export class RaccoonHost {
     // 余额是"看一眼"的东西：不阻塞快照，命中缓存就带上，否则返回上次结果。
     void this.refreshQuota({ force: false }).catch(() => undefined);
 
-    const login = loginBlock(this.loginFlow.snapshot(), this.token);
+    const login = loginBlock(this.loginFlow.snapshot(), this.displayToken());
     const base: Omit<StatusSnapshot, "diagnostics"> = {
       build: this.options.build,
       version: this.options.version,
@@ -509,8 +580,10 @@ export class RaccoonHost {
         debugLog: settings.debugLog,
         authSource: settings.authSource,
         qrProtocol: settings.qrProtocol,
+        poolEnabled: settings.poolEnabled,
       },
       desktopAuth: this.desktopStatus,
+      pool: this.poolSnapshot(),
       ...(this.catalog.error === undefined ? {} : { catalogError: this.catalog.error }),
     };
     return { ...base, diagnostics: buildDiagnostics({ build: base.build, version: base.version, snapshot: base }) };
@@ -549,7 +622,7 @@ export class RaccoonHost {
 
   /** 拉目录。失败不抛，写进 `catalog.error`。 */
   private async refreshCatalog(input: { force: boolean }): Promise<void> {
-    const token = this.token?.token;
+    const token = this.activeToken();
     if (token === undefined) {
       this.catalog = { models: [], descriptors: this.fallbackDescriptors(), ready: false };
       return;
@@ -566,31 +639,46 @@ export class RaccoonHost {
       // 登录态明确失效：把 token 标记成死的，但**不删** ——
       // 本地时钟不准是常态，删了会让"其实还活着"的 token 白丢。
       // 真删只发生在用户点退出登录时。
-      if (kind === "AUTH") {
-        this.loginFlow.markDead("登录已失效，请重新扫码。");
+      //
+      // **两个前提条件，2026-11-11 补**：
+      //
+      // 1. 号池在服务时，坏掉的是**池成员**的凭据，不是当前账号的登录态。
+      //    `recordMeasure()` 已经把那个号标成 `dead` 并在下一次请求换号 ——
+      //    这里再把主登录相位改成 `expired`，用户会看到"登录已失效，请重新扫码"，
+      //    而他的当前账号其实是好的（典型现场：装过客户端 + 池里另有一个过期号）。
+      // 2. 桌面端凭据过期时不能叫他"重新扫码" —— 他从来没扫过码，
+      //    该做的是打开官方客户端刷新（ADR-0008 只读、不代持，我们续不了）。
+      if (kind === "AUTH" && this.peekPoolAccount() === undefined) {
+        this.loginFlow.markDead(
+          this.token?.source === "desktop"
+            ? "客户端凭据已失效，请打开官方客户端重新登录。"
+            : "登录已失效，请重新扫码。",
+        );
       }
     }
   }
 
   private async loadCatalog(): Promise<CatalogState> {
-    const token = this.token?.token;
+    const token = this.activeToken();
     if (token === undefined) throw new RaccoonError("AUTH", "未登录小浣熊");
     const groups = await fetchCatalog(token, this.fetchImpl);
     const models = flattenCatalog(groups);
     if (models.length === 0) throw new RaccoonError("SERVER", "小浣熊返回的模型目录为空");
+    const deviceId = this.activeDeviceId();
     return {
       models,
       descriptors: toDescriptors(models, {
         contextCap: this.options.settings.get().contextCap,
         visionProbe: this.probes,
         sessionIdFor: (modelId) => this.sessionIdForPublish(modelId),
+        ...(deviceId === undefined ? {} : { deviceId }),
       }),
       ready: true,
     };
   }
 
   private async refreshQuota(input: { force: boolean }): Promise<void> {
-    const token = this.token?.token;
+    const token = this.activeToken();
     if (token === undefined) return;
     try {
       const state = input.force ? await this.quotaCache.get(true) : await this.quotaCache.get();
@@ -602,7 +690,7 @@ export class RaccoonHost {
   }
 
   private async loadQuota(): Promise<QuotaState> {
-    const token = this.token?.token;
+    const token = this.activeToken();
     if (token === undefined) throw new RaccoonError("AUTH", "未登录小浣熊");
     const balance = await fetchBalance(token, this.fetchImpl);
     let dailyGranted: boolean | null = null;
@@ -613,6 +701,17 @@ export class RaccoonHost {
       // 流水拿不到不影响余额展示。
       dailyGranted = null;
     }
+    // 池成员顺手更新读数：`sortForUse()` 的排序要靠它，而请求路径不能为排序
+    // 去打上游（ADR-0010 §6），所以只能在这里攒。
+    const pooled = this.resolvePoolAccount();
+    if (pooled !== undefined) {
+      this.poolQuota.set(pooled.id, {
+        ...(balance.available === undefined ? {} : { available: balance.available }),
+        ...(balance.daily === undefined ? {} : { daily: balance.daily }),
+        ...(balance.permanent === undefined ? {} : { permanent: balance.permanent }),
+        at: this.now(),
+      });
+    }
     return {
       quota: {
         available: balance.available,
@@ -621,6 +720,418 @@ export class RaccoonHost {
         dailyGranted,
         at: this.now(),
       },
+    };
+  }
+
+  // --------------------------------------------------------------------- pool
+
+  /**
+   * 把一个刚拿到（扫码 / 导入）的凭据加进号池。
+   *
+   * **不加进"当前账号"。** 加池只是"这个号以后可以被我用来顶班"，
+   * 真正用它服务要等 `poolEnabled` 打开且它被 `sortForUse()` 选中。
+   * 新成员一律 `enabled: false` —— 见 ADR-0010 §3：本机登录着不等于
+   * 用户同意拿它去花积分，必须由用户勾选一次。
+   */
+  private async addPoolAccount(token: StoredToken, source: "qr" | "desktop"): Promise<void> {
+    const principal = token.principal ?? "";
+    if (principal.length === 0) {
+      this.logger.warn("pool/add-no-principal", { source });
+      return;
+    }
+    this.accounts = upsertAccount(this.accounts, {
+      token: token.token,
+      kind: token.kind,
+      principal,
+      ...(token.expiresAt === undefined ? {} : { expiresAt: token.expiresAt }),
+      source,
+      now: this.now(),
+    });
+    await writePool(this.accounts).catch((error: unknown) => {
+      this.logger.error("pool/write-failed", { message: messageOf(error) });
+    });
+    const added = this.accounts.find((a) => a.principal === principal);
+    this.logger.info("pool/add", {
+      id: added?.id.slice(0, 8) ?? "-",
+      source,
+      total: this.accounts.length,
+      enabled: added?.enabled === true,
+    });
+    // 池成员变了，谁服务可能变（比如原来池空、现在有号但没启用 → 不变）。
+    this.syncPublisher();
+  }
+
+  /**
+   * 纯函数版选号：给定当前状态，算出"该用谁"。**不改任何字段、不打日志。**
+   *
+   * 返回 undefined 有五种情况，UI 需要能区分（`pool.note`）：
+   * 池关、池空、一个都没启用、全部在冷却、全部凭据已死。
+   *
+   * 为什么要拆出纯函数：`snapshot()` 每 20 秒被前端轮询一次（`status` 端点），
+   * 它要展示"当前用的是哪个号"。如果展示路径直接调会写状态的版本，就等于
+   * **只读路径带副作用** —— 状态字段被一次"看一眼"改写、日志被轮询节奏驱动。
+   * 拆开之后 `snapshot()` 是纯的，写状态只发生在真正要发请求的那条路径上。
+   */
+  private selectPoolAccount(): PoolAccount | undefined {
+    if (!this.options.settings.get().poolEnabled) return undefined;
+    const enabled = this.accounts.filter((a) => a.enabled);
+    if (enabled.length === 0) return undefined;
+    // 已经选定的那个还可用就继续用它。
+    //
+    // 为什么需要"粘住"：`sortForUse()` 的输入里有余额读数，而读数会在一轮对话
+    // 中途被刷新。不粘住的话，用户正在聊的这轮可能中途换到另一个号 ——
+    // 会话 id 与设备身份都跟着变，上游看到的是"一个人在两台设备上接力说话"。
+    // 只有"它不可用了"（冷却 / 被取消勾选 / 被删）才重新选。
+    const pinned = this.poolActiveId === undefined ? undefined : enabled.find((a) => a.id === this.poolActiveId);
+    if (pinned !== undefined && !isCooling(pinned, this.now())) return pinned;
+
+    const ordered = sortForUse(enabled, this.poolQuota, this.now());
+    const pick = ordered[0];
+    if (pick === undefined || isCooling(pick, this.now())) return undefined;
+    return pick;
+  }
+
+  /** 只读地看"现在该用谁"。展示路径（status / 诊断 / 设置卡）走这条。 */
+  private peekPoolAccount(): PoolAccount | undefined {
+    return this.selectPoolAccount();
+  }
+
+  /**
+   * 把"现在该用谁"定下来：粘住 + 记一次日志。**发请求的路径走这条。**
+   *
+   * 与 `peekPoolAccount()` 用同一个纯函数，所以两者结果永远一致 —— 界面显示的
+   * 当前号就是真正在发请求的那个号。
+   */
+  private resolvePoolAccount(): PoolAccount | undefined {
+    const pick = this.selectPoolAccount();
+    if (pick === undefined) {
+      this.poolActiveId = undefined;
+      return undefined;
+    }
+    if (this.poolActiveId !== pick.id) {
+      this.poolActiveId = pick.id;
+      this.logger.info("pool/pick", {
+        id: pick.id.slice(0, 8),
+        candidates: this.accounts.filter((a) => a.enabled).length,
+      });
+    }
+    return pick;
+  }
+
+  /** 当前该用哪个 token：号池优先，退回单账号路径。 */
+  private activeToken(): string | undefined {
+    const pooled = this.resolvePoolAccount();
+    if (pooled !== undefined) return pooled.token;
+    return this.token?.token;
+  }
+
+  /** 当前该带哪个设备身份。单账号路径不带（ADR-0010 §7）。 */
+  private activeDeviceId(): string | undefined {
+    return this.resolvePoolAccount()?.deviceId;
+  }
+
+  /**
+   * 展示用的"当前账号"。**只读，不选号。**
+   *
+   * `loginBlock()` 要的是 `principal` / `kind` / `expiresAt` / `source` 四个字段，
+   * 而真正在服务的那份凭据可能是号池里的成员（`this.token` 可能是空的）。
+   * 早先这里直接传 `this.token`，后果是：只用号池的用户，设置卡上"账号"那一行
+   * 永远是 `—`，看起来像没登录成功。
+   *
+   * 走 `peekPoolAccount()` 而不是 `resolvePoolAccount()` —— 展示路径不能写状态
+   * （`snapshot()` 每 20 秒被轮询一次）。
+   */
+  private displayToken():
+    | { principal?: string; kind?: "access_token" | "xhx_token"; expiresAt?: number; source?: "qr" | "desktop" }
+    | undefined {
+    const pooled = this.peekPoolAccount();
+    if (pooled !== undefined) {
+      return {
+        principal: pooled.principal,
+        kind: pooled.kind,
+        ...(pooled.expiresAt === undefined ? {} : { expiresAt: pooled.expiresAt }),
+        source: pooled.source,
+      };
+    }
+    return this.token;
+  }
+
+  /** 记一次测量。**只对池成员记**，非成员不记（否则会白白闲置好号）。 */
+  private recordMeasure(status: number, bodyText?: string): void {
+    const pooled = this.resolvePoolAccount();
+    if (pooled === undefined) return;
+    const measure = classifyMeasure({
+      status,
+      ...(bodyText === undefined ? {} : { bodyText }),
+      now: this.now(),
+    });
+    // `undefined` = 这次失败与账号无关（典型是 HTTP 400）。记下来会让一个好号
+    // 白躺 30 分钟，比不记更糟。
+    if (measure === undefined) return;
+    // **连续成功不重复落盘**（`shouldPersistMeasure()` 里有完整理由）：
+    // `onResponse` 每次请求都会调到这里，而 `writePool()` 是整表原子写
+    // （含明文 token）。每发一轮对话就重写一遍 accounts.json，既费 IO 又把
+    // 日志刷成 `pool/measure ok` 的海洋。
+    if (!shouldPersistMeasure(pooled.measure, measure)) return;
+    this.accounts = this.accounts.map((a) => (a.id === pooled.id ? { ...a, measure } : a));
+    void writePool(this.accounts).catch(() => undefined);
+    this.logger.info("pool/measure", { id: pooled.id.slice(0, 8), state: measure.state, status });
+    // 这个号刚被判死/冷却：换下一个，并且让名册换实例（设备身份要跟着换）。
+    if (measure.state !== "ok") {
+      this.poolActiveId = undefined;
+      this.syncPublisher();
+    }
+  }
+
+  /** 号池的展示快照。**不含 token**（`status.ts` 硬规则第 1 条）。 */
+  private poolSnapshot(): StatusPool {
+    const settings = this.options.settings.get();
+    // 只读路径：`status` 每 20 秒被轮询一次，这里绝不能写 `poolActiveId` 或打日志。
+    const active = this.peekPoolAccount();
+    const enabledCount = this.accounts.filter((a) => a.enabled).length;
+    const accounts: StatusPoolAccount[] = this.accounts.map((account) => ({
+      id: account.id,
+      ...(account.label === undefined ? {} : { label: account.label }),
+      principal: account.principal.slice(0, 8),
+      ...(account.expiresAt === undefined ? {} : { expiresAt: account.expiresAt }),
+      addedAt: account.addedAt,
+      enabled: account.enabled,
+      // 只给 8 位十六进制，**不带 `raccoon-` 前缀** —— 前缀占满 8 个字符时
+      // 界面上会显示成 `raccoon-`，看起来像"设备标识是空的"。
+      device: account.deviceId.replace(/^raccoon-/, "").slice(0, 8),
+      source: account.source,
+      ...(account.measure === undefined
+        ? {}
+        : {
+            measure: {
+              state: account.measure.state,
+              at: account.measure.at,
+              ...(account.measure.until === undefined ? {} : { until: account.measure.until }),
+              ...(account.measure.note === undefined ? {} : { note: account.measure.note }),
+            },
+          }),
+      active: active !== undefined && active.id === account.id,
+    }));
+
+    const base: StatusPool = {
+      enabled: settings.poolEnabled,
+      ready: this.accounts.length > 0,
+      total: this.accounts.length,
+      enabledCount,
+      ...(active === undefined ? {} : { activeId: active.id }),
+      accounts,
+    };
+
+    // 只在"开了但没人能服务"时给 note：正常工作时多一行说明只是噪音。
+    if (settings.poolEnabled && active === undefined) {
+      if (this.accounts.length === 0) base.note = "池是空的。先加一个账号。";
+      else if (enabledCount === 0) base.note = "有账号但一个都没勾选启用，所以还是用当前账号。";
+      else base.note = "启用的账号都在冷却或凭据已失效，暂时退回当前账号。";
+    }
+    return base;
+  }
+
+  /** 加一个池成员（扫码）。 */
+  private async actionPoolAddStart(): Promise<ActionResult> {
+    const snapshot = await this.loginFlow.start("pool");
+    this.logger.info("pool/add-start", { phase: snapshot.phase });
+    return { ok: true, login: snapshot, pool: this.poolSnapshot() };
+  }
+
+  /** 把官方桌面客户端的凭据加进池（用户明确点了"导入"才走这条）。 */
+  private async actionPoolImportDesktop(): Promise<ActionResult> {
+    const auth = await readDesktopAuth({
+      now: this.now,
+      ...(this.options.desktopHome === undefined ? {} : { home: this.options.desktopHome }),
+    }).catch(() => undefined);
+    if (auth === undefined) {
+      return { ok: false, error: "没读到官方客户端登录态：先打开小浣熊客户端登录一次。", pool: this.poolSnapshot() };
+    }
+    if (auth.expiresAt !== undefined && auth.expiresAt - 60_000 <= this.now()) {
+      return { ok: false, error: "客户端凭据已过期，请打开官方客户端刷新后再导入。", pool: this.poolSnapshot() };
+    }
+    if (auth.principal === undefined) {
+      return { ok: false, error: "客户端凭据里没有账号标识，无法导入。", pool: this.poolSnapshot() };
+    }
+    await this.addPoolAccount(
+      {
+        schemaVersion: 1,
+        token: auth.token,
+        kind: auth.kind,
+        savedAt: this.now(),
+        ...(auth.expiresAt === undefined ? {} : { expiresAt: auth.expiresAt }),
+        principal: auth.principal,
+        source: "desktop",
+      },
+      "desktop",
+    );
+    return { ok: true, pool: this.poolSnapshot() };
+  }
+
+  /** 勾选/取消勾选一个池成员。即时生效（不做草稿，勾选本身就是意图）。 */
+  private async actionPoolToggle(body: Record<string, unknown>): Promise<ActionResult> {
+    const id = typeof body["id"] === "string" ? body["id"] : "";
+    if (id.length === 0) return { ok: false, error: "缺少 id 参数" };
+    const enabled = body["enabled"] === true;
+    const before = this.accounts;
+    const next = this.accounts.map((a) => (a.id === id ? { ...a, enabled } : a));
+    if (next.every((a, i) => a.enabled === before[i]?.enabled)) {
+      return { ok: false, error: "没有这个账号", pool: this.poolSnapshot() };
+    }
+    this.accounts = next;
+    try {
+      await writePool(this.accounts);
+    } catch (error) {
+      // 落盘失败要把内存回滚：否则界面显示已启用、重启后又变回未启用，
+      // 用户会以为是插件在随机忘事。
+      this.accounts = before;
+      return { ok: false, error: `保存失败：${messageOf(error)}`, pool: this.poolSnapshot() };
+    }
+    this.logger.info("pool/toggle", { id: id.slice(0, 8), enabled });
+    this.syncPublisher();
+    return { ok: true, pool: this.poolSnapshot() };
+  }
+
+  /** 删一个池成员。只删池里的，不动 `token.json`。 */
+  private async actionPoolRemove(body: Record<string, unknown>): Promise<ActionResult> {
+    const id = typeof body["id"] === "string" ? body["id"] : "";
+    if (id.length === 0) return { ok: false, error: "缺少 id 参数" };
+    const next = this.accounts.filter((a) => a.id !== id);
+    if (next.length === this.accounts.length) {
+      return { ok: false, error: "没有这个账号", pool: this.poolSnapshot() };
+    }
+    this.accounts = next;
+    this.poolQuota.delete(id);
+    await writePool(this.accounts).catch((error: unknown) => {
+      this.logger.error("pool/write-failed", { message: messageOf(error) });
+    });
+    this.logger.info("pool/remove", { id: id.slice(0, 8), total: this.accounts.length });
+    this.syncPublisher();
+    return { ok: true, pool: this.poolSnapshot() };
+  }
+
+  /**
+   * 一键签到：所有池成员（**含未启用的**）。
+   *
+   * 为什么含未启用的：签到是"把这个号今天该拿的拿到"，与"要不要拿它去服务"
+   * 是两件事。用户把号加进池就是想管它。
+   *
+   * 三条纪律（照 workbuddy 的教训）：
+   * 1. **先查后写**：`granted:false` 幂等是上游行为不是契约，能不打就不打。
+   * 2. **单个失败不中断整批**：一个号挂了不能让后面的号签不到。
+   * 3. **与 `poolEnabled` 无关**：关掉自动换号不等于不让签到。
+   */
+  private async actionPoolCheckin(): Promise<ActionResult> {
+    if (this.accounts.length === 0) {
+      return { ok: false, error: "池里还没有账号。", pool: this.poolSnapshot(), results: [] };
+    }
+    const results: Array<{ id: string; result: "already" | "granted" | "error"; message?: string }> = [];
+    let touched = false;
+    for (const account of this.accounts) {
+      const id = account.id;
+      try {
+        let already = false;
+        try {
+          const bills = await fetchBills(account.token, this.fetchImpl, 20);
+          already = todayGranted(bills, new Date(this.now())) !== undefined;
+        } catch {
+          // 流水拿不到不算"已签"，继续走写接口 —— 宁可多打一次也别漏签。
+          already = false;
+        }
+        if (already) {
+          results.push({ id, result: "already" });
+          continue;
+        }
+        const grant = await grantDaily(account.token, this.fetchImpl);
+        touched = true;
+        results.push({ id, result: grant.granted ? "granted" : "already" });
+        // 领到了就刷新这个号的余额读数，下次选号排序用得上。
+        const balance = await fetchBalance(account.token, this.fetchImpl).catch(() => undefined);
+        if (balance !== undefined) {
+          this.poolQuota.set(id, {
+            ...(balance.available === undefined ? {} : { available: balance.available }),
+            ...(balance.daily === undefined ? {} : { daily: balance.daily }),
+            ...(balance.permanent === undefined ? {} : { permanent: balance.permanent }),
+            at: this.now(),
+          });
+        }
+      } catch (error) {
+        results.push({ id, result: "error", message: messageOf(error) });
+      }
+    }
+    this.logger.info("pool/checkin", {
+      total: results.length,
+      granted: results.filter((r) => r.result === "granted").length,
+      already: results.filter((r) => r.result === "already").length,
+      failed: results.filter((r) => r.result === "error").length,
+    });
+    if (touched) {
+      // 当前账号的余额也可能被这轮改到了（如果它就是池成员）。
+      this.quotaCache.clear();
+      void this.refreshQuota({ force: false }).catch(() => undefined);
+      this.syncPublisher();
+    }
+    return { ok: true, pool: this.poolSnapshot(), results };
+  }
+
+  /**
+   * 测一个池成员还活着没。
+   *
+   * **打 `model_catalog` 而不是发真对话**：目录端点要鉴权、要限流、要过设备头，
+   * 已经足够判定"这个号还能不能用"，成本却是 0 token。workbuddy 用 25k 输入的
+   * 真实探测，是因为它没有这种"零成本但同样需要鉴权"的端点可用。
+   */
+  private async actionPoolTest(body: Record<string, unknown>): Promise<ActionResult> {
+    const id = typeof body["id"] === "string" ? body["id"] : "";
+    const account = id.length === 0 ? undefined : this.accounts.find((a) => a.id === id);
+    if (account === undefined) return { ok: false, error: "没有这个账号", pool: this.poolSnapshot() };
+
+    let status = 0;
+    let ok = false;
+    let message: string | undefined;
+    try {
+      const groups = await fetchCatalog(account.token, this.fetchImpl, { deviceId: account.deviceId });
+      ok = groups.length > 0;
+      status = 200;
+      if (!ok) message = "目录是空的";
+    } catch (error) {
+      message = messageOf(error);
+      status =
+        error instanceof RaccoonError && error.status !== undefined
+          ? error.status
+          : error instanceof RaccoonError && error.kind === "AUTH"
+            ? 401
+            : 0;
+    }
+
+    const measure = classifyMeasure({ status, ...(message === undefined ? {} : { bodyText: message }), now: this.now() });
+    this.accounts = this.accounts.map((a) => (a.id === id ? { ...a, ...(measure === undefined ? {} : { measure }) } : a));
+    await writePool(this.accounts).catch(() => undefined);
+    this.logger.info("pool/test", {
+      id: id.slice(0, 8),
+      ok,
+      status,
+      state: measure?.state ?? "-",
+    });
+    if (measure?.state === "ok" || measure?.state === "limited") {
+      // 手动测试是唯一能让 `dead` 回池的路径（ADR-0010 §5）。
+      const balance = await fetchBalance(account.token, this.fetchImpl).catch(() => undefined);
+      if (balance !== undefined) {
+        this.poolQuota.set(id, {
+          ...(balance.available === undefined ? {} : { available: balance.available }),
+          ...(balance.daily === undefined ? {} : { daily: balance.daily }),
+          ...(balance.permanent === undefined ? {} : { permanent: balance.permanent }),
+          at: this.now(),
+        });
+      }
+    }
+    this.syncPublisher();
+    return {
+      ok: true,
+      tested: id,
+      healthy: ok,
+      ...(message === undefined ? {} : { message }),
+      pool: this.poolSnapshot(),
     };
   }
 
@@ -638,16 +1149,40 @@ export class RaccoonHost {
   private syncPublisher(): void {
     if (this.disposed) return;
     const settings = this.options.settings.get();
-    const models = this.catalog.descriptors.length > 0 ? this.catalog.descriptors : this.fallbackDescriptors();
-    this.publisher.sync(
-      {
-        enabled: settings.enabled,
-        reasoningEnabled: settings.reasoning,
-        models,
-        token: this.token?.token,
+    const models = this.catalog.models.length > 0 ? this.catalog.models : fallbackAsModels();
+    const deviceId = this.activeDeviceId();
+    // **名册每次重建**，不复用 `catalog.descriptors`：设备身份是名册级属性
+    // （`profileOptions()` 不透传请求头，见 adapter.ts 的注释），换号就必须换
+    // 一份带新 `x-client-device-id` 的 descriptor，否则请求还带着上一个号的身份。
+    const descriptors = toDescriptors(models, {
+      contextCap: settings.contextCap,
+      visionProbe: this.probes,
+      sessionIdFor: (modelId) => this.sessionIdForPublish(modelId),
+      ...(deviceId === undefined ? {} : { deviceId }),
+    });
+    const resolve = async (): Promise<string | undefined> => this.activeToken();
+    const input = {
+      enabled: settings.enabled,
+      reasoningEnabled: settings.reasoning,
+      models: descriptors,
+      token: this.activeToken(),
+      ...(deviceId === undefined ? {} : { deviceId }),
+    };
+    if (deviceId === undefined) {
+      // 单账号路径：不传 account，行为与 ADR-0008 时期完全一致。
+      this.publisher.sync(input, resolve);
+      return;
+    }
+    const account: PublishAccountResolver = {
+      resolve: async () => {
+        const pooled = this.resolvePoolAccount();
+        return pooled === undefined ? undefined : { token: pooled.token, deviceId: pooled.deviceId };
       },
-      async () => this.token?.token,
-    );
+      onResponse: (status: number) => {
+        this.recordMeasure(status);
+      },
+    };
+    this.publisher.sync(input, resolve, account);
   }
 
   private fallbackDescriptors(): ModelDescriptor[] {
@@ -671,7 +1206,10 @@ export class RaccoonHost {
    * 看到"一个账号几分钟内开了几百个会话"，那是它反感的东西。
    */
   private sessionIdForPublish(modelId: string): string {
-    const principal = this.token?.principal ?? "anonymous";
+    // 号池里每个号必须有**自己的** session id：它按 principal 定型，换了号
+    // 还用上一个号的会话 id，网关那边看到的是"同一个会话换了个人在说话"。
+    const pooled = this.resolvePoolAccount();
+    const principal = pooled?.principal ?? this.token?.principal ?? "anonymous";
     return sessionIdFor(principal, modelId);
   }
 

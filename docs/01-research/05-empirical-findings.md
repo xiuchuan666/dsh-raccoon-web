@@ -575,6 +575,205 @@ headers: { Authorization: `Bearer ${token}`, ...(orgCode === undefined ? {} : { 
 
 ---
 
+## E-036 · 每日积分有独立写接口，且幂等（2026-11-11 实测）
+
+在官方桌面端 `app.asar`（`C:\Program Files\@raccoonoffice-desktop\resources\app.asar`，336,918,710 字节）里用 latin1 全量扫描枚举出 **57 个 `/api/web/...` 端点**，其中与积分写入相关的是一个我们此前完全不知道的端点：
+
+```
+POST /api/web/desktop/v1/login/points/grant
+```
+
+官方调用上下文（asar 内原文）：
+
+```js
+fetchWithAuth(`${base}/api/web/desktop/v1/login/points/grant`, {
+  method: "POST",
+  headers: {
+    "X-Client-Platform": n,
+    ...(s ? { "X-Client-Version": s.startsWith("v") ? s : `v${s}` } : {}),
+    ...(a ? { "X-Org-Code": a } : {}),
+  },
+})
+// 随后判 0 === n.code && n.data?.granted 才弹 SHOW_POINT_GRANT_POPUPS
+```
+
+**它不带 body。**
+
+用桌面端 token 实测（连续两次）：
+
+```
+POST /api/web/desktop/v1/login/points/grant
+→ 200 {"code":0,"message":"success","data":{"granted":false,"popup":null}}   （262ms）
+→ 200 {"code":0,"message":"success","data":{"granted":false,"popup":null}}   （158ms）
+```
+
+结论：
+
+1. `points.ts` 文件头那句「浣熊没有独立的签到接口，每日积分是当天首次带登录态访问网页时由服务端发放的」**是错的**，已按本条修正。
+2. `granted: false` 表示**今日已领**（当天早些时候官方客户端启动时已经领过），不是失败。
+3. 接口**幂等**：重复打不会报错、不会重复发放。但"上游恰好幂等"不等于契约，批量签到仍然先查 `bills` 再决定要不要写。
+4. 签到状态**不需要额外端点**：`granted` 就是判据；本地另有一条 `todayGranted(bills)` 从 `biz_type === "daily_grant"` 的流水里判。
+
+---
+
+## E-037 · `POST /api/web/auth/v1/refresh`：字段名是 `token`，但格式校验猜不出来 → **本项目不做自动续期**（2026-11-11 实测，四轮）
+
+asar 里确实有这个端点，且 SDK 文档明确写了「access token 过期应优先用 `/api/web/auth/v1/refresh` 刷新，不要把重新登录作为常规续期方式」。
+
+### 第一轮：端点探测
+
+```
+POST /api/web/auth/v1/refresh        （空 body）
+→ 400 {"code":100000,"message":"request_body_error","details":"request body empty or json invalid"}
+```
+
+### 第二轮：asar 静态搜索（`app.asar` 336,918,710 字节）
+
+`/api/web/auth/v1/refresh` 在 asar 里**只出现 1 次**（offset 74078848），且是 SDK 文档段落（`callScore = 0` / `docScore = 1`）—— **官方桌面端自己也不调它**。
+
+候选字段名计数：`refresh_token` 289、`refreshToken` 1545、`access_token` 619、`accessToken` 2468、`expires_in` 372、`expiresIn` 155、`clientDeviceID` 20、`client_device_id` 2、**`installId` 0**、`deviceId` 15。
+
+### 第三轮：9 种 body 形状（带 / 不带 `Authorization`）
+
+试过 `{}`、`{"refresh_token":"x"}`、`{"refreshToken":"x"}`、`{"token":"x"}`、`{"access_token":"x"}`、`{"accessToken":"x"}`、`{"grant_type":"refresh_token","refresh_token":"x"}` 等 9 种 —— **全部**同一条：
+
+```
+400 {"code":100002,"message":"params_invalid_error","details":"param token invalid format invalid"}
+```
+
+连 `{}` 空对象也报"`param token` invalid" —— 说明**字段名就是 `token`**，而且它在报"格式"而不是"缺失"。
+
+### 第四轮：17 种 `token` 取值形状
+
+`""` / `"abc"` / `"a.b.c"` / 合法三段 JWT / 已过期 JWT / `"Bearer "+JWT` / 32 hex / 64 hex / UUID / `rt_`·`rt-`·`xrt_` 前缀 / base64url 432·320·512 字符 / 纯字母 432 / 纯数字 432 / 13 位数字串 / `数字串+32hex` / 64 字节 base64 —— **全部**同一条 `100002 format invalid`。
+
+（**刻意不放真 token**：refresh 很可能 rotate，一 rotate 就把用户官方客户端踢下线，这个代价不能拿来试。）
+
+### 结论
+
+1. 端点存在；**body 字段名是 `token`**；它的格式校验无法从外部暴力猜出。
+2. 即便猜出来也没用 —— refresh 会 rotate，一 rotate 就把官方客户端踢下线。**收益（省一次手动重登）远小于风险（把用户正开着的客户端弄掉线）**。
+3. **所以本项目不做 token 自动续期**，改为"凭据过期时引导用户去官方客户端刷新"。已有落地：`desktopAuth.reason = "客户端凭据已过期，请打开官方客户端刷新"`，`authSource` 三态下 `desktop` 过期会让 `login.phase = expired` 并在设置卡里显示这句话。
+4. 这条是**有证据的"不做"**，不是放弃。ADR-0008 里「IAM 没有 refresh grant」这句在事实层面错、在决策层面仍然成立（理由是 rotate 风险，不是"没有接口"）。下次回来别再把"没找到"当成"不存在"，也别把"找到了"当成"该做"。
+
+---
+
+## E-038 · 设备身份：`X-Client-Device-ID` 是唯一抓手，且要求"同账号稳定"（2026-11-11 asar 逆向）
+
+asar 内 SDK CHANGELOG 原文（GBK 乱码但可辨）：
+
+- `miniapp-wechat` 固定发 `X-Client-Device-ID: miniapp-wechat-account`；省略 `clientDeviceID` 合法，显式传其它值会**立刻报错**。
+- 普通 App/Desktop **必须传真实 install ID**。
+- `DEVICE_LINK_REVOKED / 4003` → 重新扫码；`SESSION_REVOKED / 4004` → 重新登录并停止重连。
+- 重新登录时须带**与可信设备绑定一致的** `X-Client-Platform` 与 `X-Client-Device-ID`，否则新 session 可能不是 trusted device。
+- `ai-glasses` 平台省略 `clientDeviceID`，HTTP 与 header-auth WSS 都**不发** `X-Client-Device-ID`（服务端按登录账号派生 identity）。
+
+另有 `POST /api/web/auth/v1/mp/devices_current_bind` 是设备绑定写接口（小程序侧用，无身份字段 bind schema）。
+
+实测对照（带不带 `X-Client-Device-ID`）：
+
+| 端点 | 不带 | 带 `raccoon-<32hex>` |
+| --- | --- | --- |
+| `GET /api/web/points/v1/balance` | 200 `available_points:383` | 200 **完全一致** |
+| `GET /api/web/llm/v2/model_catalog` | 200，9 模型 | 200，9 模型**全部可见** |
+
+结论：
+
+1. 上游**没有**要求设备指纹签名（这点与 workbuddy 的 Turing SDK 路线不同），它要的只是"同一个账号每次带同一个 install ID"。
+2. 所以号池的"独立环境"= **每账号一个稳定的随机 device id**，属于身份隔离，不是指纹伪造。文档里不能把它说成"防封"。
+3. `x-client-platform` 保持 `desktop-windows` 不变（与真实客户端一致），变了反而可疑。
+4. 目录里 9 个模型**全部可见**，含 3 个 `visible:false` 的 `raccoon-090dd3` / `raccoon-19b265` / `raccoon-405a1c`（`billing_effective_multiplier` 均为 1）。`visible:false` 是我们自己的过滤决定，不是网关拒绝。
+
+---
+
+## E-039 · 免费模型的真实倍率是 `billing_effective_multiplier`，不是 `billing_multiplier`（2026-11-11 实测）
+
+`GET /api/web/llm/v2/model_catalog` 原始响应里，两条 `sn-sensenova-6-8-flash*`：
+
+```json
+{
+  "billing_status": "limited_free",
+  "billing_status_note": "限免至11月30日",
+  "billing_multiplier": 0.5,
+  "billing_effective_multiplier": 0,
+  "billing_discounts": [{ "end_at": "2026-12-01T00:00:00+08:00" }]
+}
+```
+
+结论：
+
+1. **实际计费倍率是 `billing_effective_multiplier`（0）**，`billing_multiplier`（0.5）是标价。
+2. 我们此前的 `catalog.ts` 优先取 `billing_effective_multiplier`，顺序是对的；但显示名后缀曾经按标价拼过 `x0.50`，属于误导 —— 用户会以为在用收费模型而不敢用。
+3. `billing_status_note` 是给人看的文案（"限免至11月30日"），可以原样透出到 UI。
+4. `end_at` 是**优惠结束时刻**，不是"当前是否免费"的判据 —— 判据只有 `billing_effective_multiplier`。
+
+---
+
+## E-018 · 图片：公网 URL 与 `data:` base64 **都支持**，裸 base64 会被当成 URL 去下载（2026-11-11 实测，两轮）
+
+`POST /api/web/llm/v2/chat/completions` 的 `messages[].content` 里 `{"type":"image_url","image_url":{"url":"…"}}` 的 `url` 到底该放什么。
+
+### 第一轮：拿手抄的 base64 试（结论：手抄的那串是坏的）
+
+| 用例 | 状态 | 耗时 | message |
+| --- | --- | --- | --- |
+| 公网 URL（google logo） | 400 | 30.3s | `image download failed` |
+| base64（8×8 硬编码串） | 400 | 206ms | `invalid image base64 content` |
+| 纯文字对照 | 200 | 2.9s | — |
+
+### 第二轮：用 `zlib.crc32` + `deflateSync` 现场生成确定合法的 64×64 纯红 PNG（132 字节）
+
+| 用例 | 状态 | 耗时 | 关键信息 |
+| --- | --- | --- | --- |
+| `https://www.google.com/images/branding/googlelogo/1x/…png` | 400 | 30315ms | `image download failed` |
+| `https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/…png` | 400 | 10370ms | `image download failed` |
+| **`https://httpbin.org/image/png`** | **200** | 3459ms | reasoning 认出 "an image of a cartoon pig face" |
+| **`data:image/png;base64,<真 PNG>`**（`sn-sensenova-6-8-flash`） | **200** | 1928ms | reasoning "a solid bright …" |
+| **`data:image/png;base64,<真 PNG>`**（`sn-kimi-k3`） | **200** | 5714ms | reasoning "Image solid red" |
+| 裸 base64（无 `data:` 前缀） | 400 | 233ms | `image download failed` |
+
+### 结论
+
+1. **两种都支持** —— 公网 URL 与 `data:image/...;base64,` 都能用，模型也确实"看到"了图（reasoning 里说得出颜色/内容）。
+2. `image download failed` 是**服务端去下载那个 URL 失败**（google / wikimedia 在我们这台机器所在网络里下载不到或超时，httpbin 成功），**不是"不支持 URL"**。第一轮差点据此写成"只支持 base64"，是错的。
+3. **裸 base64 会被当成 URL 去下载** → 233ms 就回 `image download failed`（因为 `iVBORw0KG…` 不是合法 URL）。所以 base64 **必须带 `data:image/<mime>;base64,` 前缀**。
+4. 所有失败一律 `400 invalid_request_error`，与"图太大 / 格式坏 / 下载失败"共用同一个 `code:"400"`，**只能靠 `message` 区分**，不能靠状态码。
+5. 对我们插件的意义：DSH 传下来的图片通常是 data URL（粘贴/上传），这条路是通的；如果用户贴的是公网图链，失败原因大概率是"我们这边连不上那个站"，不是网关不支持 —— 报错文案要写清这一点，别让用户以为插件不支持识图。
+
+---
+
+## E-019 · 请求体上限：约 **3.0001 MiB（3,145,650 ± 50 字节）**，超了报 `400 inference request is invalid`（不是 413）（2026-11-11 实测）
+
+判据用"纯文本填充"而不是图片，避免掺进 E-018 的 30 秒下载超时。每档都精确控制 **JSON 请求体字节数**（反解填充文本长度，误差 0 字节）。
+
+| 请求体字节数 | 状态 | 说明 |
+| --- | --- | --- |
+| 533,812（0.5 MB） | 200 | SSE 正常 |
+| 1,067,462（1 MB） | 200 | 4180ms |
+| 2,134,763（2 MB） | 200 | 4013ms |
+| 2,401,588 / 2,668,413 / 2,935,238 | 200 | 20.2s / 20.3s / 20.7s |
+| 3,135,162 | 200 | 20196ms |
+| 3,136,000 | 200 | 6346ms |
+| 3,140,000 | 200 | 9285ms |
+| 3,143,000 | 200 | 7191ms |
+| 3,145,000 | 200 | 6465ms |
+| **3,145,600** | **200** | 5941ms ← 最后一次成功 |
+| **3,145,700** | **400** | `inference request is invalid` ← 第一次失败 |
+| 3,145,728（= 3 MiB） | 400 | `inference request is invalid` |
+| 3,195,233 / 3,202,035 / 3,202,065 / 3,202,063 | 400 | 同上 |
+| 4,269,364（4 MB） | 400 | 同上，5637ms |
+| 8,538,566（8 MB） | 400 | 同上，9363ms |
+
+### 结论
+
+1. **阈值落在 3,145,600 与 3,145,700 字节之间**，即约 **3.0001 MiB（3,145,650 ± 50）**，不是整 3 MiB、也不是整 4 MiB。多次重跑 3,145,700 稳定 400、3,145,600 稳定 200。
+2. 超限**不返回 413**，返回 **`400` + `{"error":{"code":"400","message":"inference request is invalid"}}`**。这条很重要：**413 永远不会出现**，按 413 做分支是死代码。错误 message 与"参数非法"共用，无法从响应区分"太大"和"字段错"。
+3. 失败响应在 3.1~9.4 秒内返回，说明是**网关侧读完 body 之后才判**，不是连接层拒收 —— 客户端会先把几 MB 传完。
+4. 2.4~3.1 MB 那几档耗时 20 秒（正常 4~9 秒），是"接近上限"的征兆，不是超时。
+5. 对我们插件的意义：`max_tokens` 与上下文再大也没用，**请求体硬上限约 3 MiB**；DSH 一轮长对话 + 多图很容易撞上。`contextCap` 默认 128,000 在这个上限面前是安全的（纯文本 128k token 约 500 KB），但**贴多张大图会先撞 3 MiB 而不是撞 token**。UI 报错时应该说"请求体超过上游约 3 MiB 上限"，而不是说"上下文超长"。
+
+---
+
 ## 待补的实测
 
 | # | 内容 | 状态 |
@@ -583,7 +782,11 @@ headers: { Authorization: `Bearer ${token}`, ...(orgCode === undefined ? {} : { 
 | E-015 | 带/不带 `x-client-platform` 的对比 | ✅ E-034：无可观测差异 |
 | E-016 | `extra_body.thinking` 是否仍接受 | ✅ E-035：生效 |
 | E-017 | SSE error frame 形状 | ✅ 三种形状已由 `parseFrame` 覆盖 + 单测；真实限流帧仍待撞一次 |
-| E-018 | 图片：base64 vs URL | ⬜ **仍缺**：需要一次真实识图请求 |
-| E-019 | 413 的真实阈值 | ⬜ **仍缺**：需要一次大图请求 |
+| E-036 | 每日积分写接口 | ✅ 已实测：`POST /api/web/desktop/v1/login/points/grant`，幂等 |
+| E-037 | token refresh 的 body 形状 | ✅ 已实测四轮：字段名 `token`、格式不可猜、**决定不做自动续期**（rotate 风险） |
+| E-038 | 设备身份头 | ✅ 已实测：`X-Client-Device-ID` 唯一，不要求签名 |
+| E-039 | 免费模型的真实倍率字段 | ✅ 已实测：`billing_effective_multiplier` |
+| E-018 | 图片：base64 vs URL | ✅ 已实测：**两种都支持**，裸 base64 会被当 URL |
+| E-019 | 413 的真实阈值 | ✅ 已实测：**约 3.0001 MiB，且返回 400 不是 413** |
 
-剩下两条都只需要"已有登录态下发一次带图的请求"，不再需要人工扫码。
+**已无待补项。** 下一批实测只在上游行为变化时才有意义（例如网关改了目录字段、改了体积上限、或真的撞到 200429 限流帧）。

@@ -74,11 +74,15 @@ const INERT_AUTH = {
  *
  * 三项来自 sensenova 的 `imageBudgets()`（llm-adapter-core.js:383-389），
  * 数值原样保留：
- * - `maxRequestImageBytes: 20MB` —— 单请求体上限。浣熊网关超了会回
- *   HTTP_413（实测见 docs/01-research/05-empirical-findings.md）。
- * - `requestImagePixelBudget: 640000` —— 约 800×800，是"10MB 请求体"
- *   反推出来的安全像素数。超过这个数，一张 4K 截图就会把请求撑爆。
+ * - `maxRequestImageBytes: 20MB` —— 单个请求里图片的总字节预算（**内核侧预检**，
+ *   在我们自己发出去之前就把图压小）。
+ * - `requestImagePixelBudget: 640000` —— 约 800×800。E-019 实测网关请求体硬上限约
+ *   **3.0001 MiB**，这个像素数单张压缩后 200 KB~1.5 MB，两张以内安全。
  * - `requestImageMaxBytes: 1MB` —— 单张图。
+ *
+ * ⚠️ 别把 `maxRequestImageBytes` 当成"网关上限"：它是内核自己的预检值，比网关宽松得多。
+ * 网关超限回的是 **400 `inference request is invalid`，不是 413**（E-019），
+ * 那条判定在 `src/protocol/chat.ts` 里做。
  */
 const IMAGE_BUDGETS = {
   maxRequestImageBytes: 20 * 1024 * 1024,
@@ -119,6 +123,15 @@ const RETRY_POLICY = {
 export interface AdapterOptions {
   /** 每次请求都读一次 —— token 会在登录 / 退出 / 过期时变。 */
   resolveToken: () => Promise<string | undefined>;
+  /**
+   * 号池路径（ADR-0010）：一次解析出「用哪个账号」+「它的设备身份」。
+   *
+   * 与 `resolveToken` 二选一 —— 传了它就优先用它。号池关着的时候 host 不传，
+   * 走的还是老路径，行为与之前完全一致。
+   */
+  resolveAccount?: () => Promise<{ token: string; deviceId: string } | undefined>;
+  /** 一次请求结束时的 HTTP 状态（来自 pi-ai 的 `onResponse`）。用于记测量。 */
+  onResponse?: (status: number) => void;
   /** 模型名册。换名册要换整个 adapter 实例（见 publish.ts）。 */
   models: readonly ModelDescriptor[];
   /** DSH 的服务访问器（`resolveAttachments` / `resolveImageAccess` 要它）。 */
@@ -142,7 +155,24 @@ export interface AssembledAdapter {
  * 所以它可以在 `apply()` 里同步调用，不需要 await。
  */
 export function assembleAdapter(options: AdapterOptions): AssembledAdapter {
-  const { models, displayName, resolveToken, get, reasoningEnabled } = options;
+  const { models, displayName, resolveToken, resolveAccount, onResponse, get, reasoningEnabled } = options;
+
+  /**
+   * 号池路径下"这次用哪个账号"由 `resolveAccount()` 决定；老路径用 `resolveToken()`。
+   *
+   * **为什么设备身份不在这里注入。** 设备头 `x-client-device-id` 属于
+   * `model.headers`（roster 建 descriptor 时写死），而 pi-ai 的
+   * `profileOptions()` 不透传 `options.headers`（只传 apiKey/reasoning/
+   * thinkingBudgets/cacheRetention/transport/timeoutMs/websocketConnectTimeoutMs）。
+   * 所以每请求改头这条路走不通 —— 改成"换号就重建名册"：
+   * `rosterSignature()` 末尾带 `|dev:<deviceId>`，换号 → 指纹变 → Publisher
+   * 释放再注册，新 descriptor 带着新设备头。见 docs/02-design/07-account-pool.md。
+   */
+  const resolveKey = async (): Promise<string | undefined> => {
+    if (resolveAccount === undefined) return await resolveToken();
+    const account = await resolveAccount();
+    return account?.token;
+  };
 
   /**
    * `api` 传的是**单个 Api 对象**，不是 `{[apiId]: Api}` 映射。
@@ -155,7 +185,10 @@ export function assembleAdapter(options: AdapterOptions): AssembledAdapter {
    * 的路径会把 effort 先一步翻译成 `thinkingBudgets` 再传，那时 `options.reasoningEffort`
    * 可能已经是 `undefined`。这时退回 settings 的开关（开 → "on"，关 → "off"）。
    */
-  const api = createRaccoonApi(() => (reasoningEnabled ? "on" : "off"));
+  const api = createRaccoonApi(
+    () => (reasoningEnabled ? "on" : "off"),
+    onResponse === undefined ? undefined : (status: number) => onResponse(status),
+  );
 
   const provider = {
     ...createProvider({
@@ -192,7 +225,7 @@ export function assembleAdapter(options: AdapterOptions): AssembledAdapter {
             const key =
               fromCredential !== undefined && fromCredential.length > 0
                 ? fromCredential
-                : await resolveToken();
+                : await resolveKey();
             if (key === undefined || key.length === 0) return undefined;
             return { auth: { apiKey: key }, source: displayName };
           },
@@ -231,7 +264,7 @@ export function assembleAdapter(options: AdapterOptions): AssembledAdapter {
     profiles: () => profiles,
     auth: INERT_AUTH,
     resolveApiKey: async () => {
-      const token = await resolveToken();
+      const token = await resolveKey();
       if (token === undefined || token.length === 0) {
         /**
          * 这里抛的错会被 `PiAiAdapter` 归成 `MISSING_CREDENTIAL`，
@@ -239,7 +272,14 @@ export function assembleAdapter(options: AdapterOptions): AssembledAdapter {
          * （lib/index.js:1830-1982）。所以未登录时模型选择器里没有小浣熊，
          * 但整个 provider 不会消失到让设置页报错 —— 这正是我们要的。
          */
-        throw new Error("未登录小浣熊：请先在设置 → 插件 → 小浣熊 里扫码登录。");
+        /**
+         * 文案同时给两条路，因为这里不知道用户手上有哪种凭据：
+         * 装过官方客户端的人**不需要**扫码（ADR-0008 会自动读它的 `auth.json`），
+         * 只让他去扫码等于把首选路线藏起来。
+         */
+        throw new Error(
+          "未登录小浣熊：装过官方客户端的话直接打开它登录即可；没有客户端就在设置 → 插件 → 小浣熊 里扫码登录。",
+        );
       }
       return token;
     },

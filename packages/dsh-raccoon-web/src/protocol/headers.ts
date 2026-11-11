@@ -42,8 +42,12 @@ export function iamHeaders(): Record<string, string> {
  * 删掉这个 key 与留空串是两回事：网关会把"没有组织头"当成另一种上下文。
  * 这是参考实现里唯一被两个独立实现都保留的私有头，说明它是必需的。
  */
-export function webHeaders(token: string, language: "zh" | "zh-CN" = "zh"): Record<string, string> {
-  return {
+export function webHeaders(
+  token: string,
+  language: "zh" | "zh-CN" = "zh",
+  deviceId?: string,
+): Record<string, string> {
+  const out: Record<string, string> = {
     accept: "application/json",
     authorization: `Bearer ${token}`,
     "x-org-code": "",
@@ -51,6 +55,10 @@ export function webHeaders(token: string, language: "zh" | "zh-CN" = "zh"): Reco
     "x-client-platform": clientPlatform(),
     "x-client-version": CLIENT_VERSION,
   };
+  // 设备身份只在号池路径下带（ADR-0010 §7）。老路径（单账号）不带，
+  // 因为那时的"设备"就是官方客户端本身，我们不该替它声明另一个身份。
+  if (deviceId !== undefined) out["x-client-device-id"] = deviceId;
+  return out;
 }
 
 /**
@@ -84,8 +92,12 @@ export function chatHeaders(
  * 这几个头是**按模型**定型的（`x-raccoon-session-id` 依赖 model id），
  * 所以可以烘进 descriptor；token 变了 descriptor 会重建（见 host/publish.ts）。
  */
-export function chatModelHeaders(sessionId: string, language: "zh" | "zh-CN" = "zh"): Record<string, string> {
-  return {
+export function chatModelHeaders(
+  sessionId: string,
+  language: "zh" | "zh-CN" = "zh",
+  deviceId?: string,
+): Record<string, string> {
+  const out: Record<string, string> = {
     accept: "application/json",
     "x-org-code": "",
     "x-raccoon-language": language,
@@ -93,6 +105,8 @@ export function chatModelHeaders(sessionId: string, language: "zh" | "zh-CN" = "
     "x-client-version": CLIENT_VERSION,
     "x-raccoon-session-id": sessionId,
   };
+  if (deviceId !== undefined) out["x-client-device-id"] = deviceId;
+  return out;
 }
 
 /** IAM confirm 用的头：Bearer + 中文语言位（不带客户端标识）。 */

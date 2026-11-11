@@ -1,9 +1,9 @@
 # 状态与存储
 
-最后更新: 2026-11-06（按实现回填）
+最后更新: 2026-11-11（按实现回填，补账号池 `accounts.json`）
 状态: 已定稿
 
-> 一句话：**我们自己扫码得来的 token 单独放；官方客户端的凭据只读进内存、不落盘；其余全进内存。**
+> 一句话：**我们自己扫码得来的 token 单独放；官方客户端的凭据只读进内存、不落盘；号池单独一个文件放多份 token；其余全进内存。**
 
 ---
 
@@ -13,12 +13,14 @@
 | --- | --- | --- | --- | --- |
 | 扫码得到的 access token | `$DSH_HOME/state/dsh-raccoon-web/token.json` | JSON | 跨重启，直到失效/登出 | 🔴 是 |
 | 桌面端凭据 | **只在内存**（源文件 `~/.office-raccoon/agent/config/auth.json`） | JWT 字符串 | 仅本次进程 | 🔴 是 |
+| 账号池（多份 token + 设备身份 + 测量） | `$DSH_HOME/state/dsh-raccoon-web/accounts.json` | JSON | 跨重启 | 🔴 是（含明文 token） |
 | 识图自检结果 | `$DSH_HOME/state/dsh-raccoon-web/vision-probe.json` | JSON | 跨重启 | 🟢 否 |
 | 插件开关 | `settings-legacy.yaml` 的 `dsh-raccoon-web` ns | YAML | 跨重启 | 🟢 否 |
 | 模型目录 | 进程内存 | — | 5 分钟 TTL | 🟢 否 |
 | 积分 | 进程内存 | — | 60 秒 TTL | 🟢 否 |
+| 号池余额读数 | 进程内存（`poolQuota` Map） | — | 10 分钟内算"新鲜"（`POOL_QUOTA_FRESH_MS`） | 🟢 否 |
 | 二维码会话 | 进程内存 | — | 5 分钟（本地 deadline） | 🟡 短期 |
-| 登录相位 | 进程内存（`LoginFlow`） | — | 进程生命周期 | 🟢 否 |
+| 登录相位 + `mode` | 进程内存（`LoginFlow`） | — | 进程生命周期 | 🟢 否 |
 
 数据目录 = `$DSH_HOME/state/dsh-raccoon-web/`，其中 `$DSH_HOME` 缺省是 `~/.dsh`（`host/store.ts` 的 `dshHome()`）。
 
@@ -129,6 +131,73 @@ const expired = auth.expiresAt !== undefined && auth.expiresAt - 60_000 <= this.
 
 ---
 
+## 3.5 accounts.json（账号池）
+
+`POOL_FILE = "accounts.json"`，与 `token.json` **并列、不合并**（[ADR-0010](adr/0010-account-pool.md)）。
+
+### 结构
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "accounts": [
+    {
+      "id": "7b86c89281dbdf94",              // sha256(principal).slice(0,16)，派生值，不是用户输的
+      "label": "备用号",                      // 可选，仅展示
+      "token": "<IAM JWT>",                  // 🔴 明文
+      "kind": "access_token",
+      "principal": "pu-01a19cd4-...",
+      "expiresAt": 1796362428000,            // 可选
+      "addedAt": 1794401118286,
+      "enabled": false,                      // 新加进来默认不启用
+      "deviceId": "raccoon-c9012c1d...",     // 32 hex，每账号一个，稳定不变
+      "source": "desktop",                   // qr | desktop，记它当初怎么来的
+      "measure": {                           // 可选，最近一次测量
+        "state": "ok",                       // ok | limited | empty | dead | flaky
+        "at": 1794401145256,
+        "until": 1794402945256,              // 冷却到什么时候；dead 是 MAX_SAFE_INTEGER
+        "note": "正常",
+        "resetHint": "2026-11-12T00:00:00+08:00"
+      }
+    }
+  ]
+}
+```
+
+### 与 token.json 的三条差异
+
+| 项 | `token.json` | `accounts.json` |
+| --- | --- | --- |
+| 条数 | 恒 1 条（当前账号） | N 条 |
+| `source: "desktop"` | **不落盘**（只在内存） | **落盘**（池成员一旦导入就是我们的了，官方客户端那边过期了也还在，靠 `measure` 标 `dead`） |
+| 用途 | `authSource` 三态选中的那个 | `poolEnabled` 打开时的候选集合 |
+
+> **为什么池里的 desktop token 反而落盘**：`token.json` 不落盘是为了"客户端换账号我们下次启动自然跟着变"；池成员的语义正相反 —— 用户显式勾了"我要用这个号"，它就该留在池里，直到他自己移除或被判 `dead`。混用同一套语义会让"客户端换了账号，池里的号也跟着变"这种莫名其妙的事发生。
+
+### 写入与读取
+
+复用 `store.ts` 的 `writeJson()`（`0o600` + `.tmp` + rename 原子写）。`readPool()` 的容错：
+
+- `schemaVersion !== 1` → 返回空池（不迁移，理由同 §7）；
+- 单行坏（缺 `token` / 缺 `principal` / 不是对象）→ **跳过那一行，其余照读**（一条坏记录不该让整池消失）；
+- 缺 `enabled` → 一律 `false`（宁可少用一个号，也不要意外拿一个用户没勾的号去发请求）；
+- 缺 `deviceId` → 现场补一个 `newDeviceId()`（`normalizeAccount()`，`src/host/pool.ts:161`）。**注意它只在下次有人写盘时才固化**：只读不写的话，下次启动会再补一个新的。实际不会遇到 —— `upsertAccount()` 建号时一定带 `deviceId`（`src/host/pool.ts:220`），这条路径只对"人手改过的文件"生效，属于兜底而不是升级机制；
+- 同 `id` 重复 → 保留第一条（`readPool()` 的 `seen` Set，`src/host/pool.ts:128-134`）。
+
+### 什么时候写盘
+
+| 触发 | 写？ |
+| --- | --- |
+| `pool-add-start` 扫码成功 / `pool-import-desktop` | ✅ |
+| `pool-toggle`（勾选） | ✅（失败回滚内存里的 `enabled`，见 `actionPoolToggle()`） |
+| `pool-remove` | ✅（失败**不回滚**，只记 `pool/write-failed`） |
+| `pool-test` / `pool-checkin` | ✅（测量结果） |
+| 每轮对话的 `onResponse` → `recordMeasure()` | **只在必要时** —— `ok` 之后又是 `ok` 不写（`shouldPersistMeasure()`）。否则每说一句话就把整表明文 token 刷一遍磁盘 |
+
+> `accounts.json` 是**整表原子写**。这也是为什么 `shouldPersistMeasure()` 要存在：写一次就是全量重写，含明文 token。
+
+---
+
 ## 4. vision-probe.json
 
 ```jsonc
@@ -168,6 +237,7 @@ settings.register(SETTINGS_NS, normalizeSettings, { applies: "live" });
 | `debugLog` | `false` | 开 debug 级日志 |
 | `authSource` | `"auto"` | `auto` / `desktop` / `qr`（ADR-0008） |
 | `qrProtocol` | `"web"` | `web`（官方桌面端同款）/ `iam`（小程序码）（ADR-0009） |
+| `poolEnabled` | `false` | 打开后按号池排序自动选号；关掉立刻退回当前账号（ADR-0010） |
 
 归一化规则（`normalizeSettings`）：
 
@@ -175,6 +245,7 @@ settings.register(SETTINGS_NS, normalizeSettings, { applies: "live" });
 - 布尔：接受 `true/false`，以及 `"true"/"false"/"1"/"0"`。
 - `contextCap`：区间 **8192 – 2 000 000**，越界回默认；非数字回默认。
 - `authSource` / `qrProtocol`：`trim().toLowerCase()` 后命中白名单才用，否则回默认（所以 `"QR"` → `"qr"`、`"  Auto "` → `"auto"`、`"bogus"` / `42` → `"auto"`）。
+- `poolEnabled`：同布尔规则，默认 `false`（自动换号不能默认开 —— 用户没勾过任何号时它会静默改变行为）。
 - 不设 `options.validate` —— `register` 的 `validate` 抛错会让整个注册失败，而设置项填错不该让插件加载不起来。
 
 **`contextCap` 是刻意的默认值。** 目录里 `sn-kimi-k3` 的 `params.context_window` 是 1 000 000，但真按 1M 塞上下文，一次请求就撞限流（限流按账号 token 吞吐算，不是按请求数）。128K 是能连续问几轮的量级。
@@ -220,7 +291,7 @@ createTtlCache<T>(ttlMs, load, now = Date.now)
 
 | 触发 | 动作 |
 | --- | --- |
-| `logout` action（`qr` 来源） | 删 `token.json`，清 catalog/quota 缓存，`publisher.dispose("not-configured")` |
+| `logout` action（`qr` 来源） | 删 `token.json`，清 catalog/quota 缓存，`publisher.dispose("not-configured")`。**不动 `accounts.json`** —— 池成员是用户显式加进来的，与"当前账号"是两件事 |
 | `logout` action（`desktop` 来源） | **只设 `desktopIgnored = true`**，不删任何文件；UI 明说"要真正退出请到客户端里退出" |
 | 401 / 200003 | 清缓存 + `loginFlow.markDead()`，**保留文件不删**（可能是临时的网关抖动），只把相位标成 `expired` |
 | 插件卸载 | `host.dispose()` 只清内存、撤销路由、释放 registration，**不动磁盘** |
@@ -237,6 +308,7 @@ createTtlCache<T>(ttlMs, load, now = Date.now)
 | 事实 | 说明 |
 | --- | --- |
 | `token.json` 是明文 | 不上加密。加密要管密钥，密钥又要存 —— 只是把问题挪一层 |
+| `accounts.json` 也是明文 | 同上，且它比 `token.json` 更敏感（**多份** token）。所以它必须走 `shouldPersistMeasure()` 去抖，不能每轮对话重写 |
 | Windows 上 `0o600` 无效 | Node 在 Windows 忽略 mode。权限由 `%USERPROFILE%` 的 ACL 决定 |
 | 不写注册表 | 不碰 `HKCU` / `HKLM` |
 | 不写环境变量 | 不污染用户 shell |

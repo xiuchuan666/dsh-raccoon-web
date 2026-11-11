@@ -1,6 +1,6 @@
 # 观测与日志
 
-最后更新: 2026-11-06（事件名按源码 34 处 log 调用逐一核对）
+最后更新: 2026-11-11（事件名按源码 45 处 log 调用、44 个事件名逐一核对）
 状态: 已定稿
 
 > 一句话：**三个观测面各管一件事 —— 日志管"发生了什么"，status 管"现在是什么"，诊断块管"用户能贴给我什么"。**
@@ -52,7 +52,9 @@ createLogger(sink: LogSink | undefined, debugEnabled = false): Logger
 - `debug` 级别默认关，由 `settings.debugLog` 控制（`logger.setDebug(enabled)`）。
 - 四种级别：`debug` / `info` / `warn` / `error`。
 
-### 1.3 全部 34 个事件（源码逐条核对）
+### 1.3 全部 44 个事件（源码逐条核对，2026-11-11）
+
+> 核对方式：在 `packages/dsh-raccoon-web/src/` 下 grep `logger.(debug|info|warn|error)(` 共 **45 处调用、44 个不同事件名**（`publish/release` 与 `publish/dispose` 由同一个三元表达式产生）。其中号池的 10 个是 2026-11-11 加的。
 
 **插件生命周期（`src/index.ts`）**
 
@@ -74,13 +76,14 @@ createLogger(sink: LogSink | undefined, debugEnabled = false): Logger
 | `token/qr` | info | `token`(tag), `principal`, `reason` | 用了落盘的扫码 token |
 | `bootstrap/failed` | error | `message` | 冷启动整体失败（不致命，插件仍加载） |
 
-**登录流程（`src/host/login-flow.ts`）**
+**登录流程（`src/host/login-flow.ts`；`login/start` 在 `index.ts`）**
 
 | 事件 | 级别 | 字段 | 说明 |
 | --- | --- | --- | --- |
 | `login/start` | info | `phase` | 开始一次扫码 |
-| `login/qr` | info | `protocol`, `code`(前 6 位 + `…`), `expires` | 二维码生成（**两种协议都会打**） |
-| `login/ready` | info | `token`(tag), `kind`, `principal` | 扫码成功 |
+| `login/qr` | info | `protocol`, `code`(前 6 位 + `…`), `expires` | 二维码生成（**两种协议都会打**，两处调用点） |
+| `login/ready` | info | `token`(tag), `kind`, `principal` | 扫码成功（主登录） |
+| `login/pool-ready` | info | `token`(tag), `kind`, `principal` | 扫码成功（**号池加号**：不写 `token.json`、不改主登录相位） |
 | `login/ready-desktop` | info | — | 桌面端凭据就绪（不走扫码） |
 | `login/expired` | info | — | 二维码到期 |
 | `login/dead` | warn | `message` | 平台判死（`markDead()`，**不删 token 文件**） |
@@ -95,7 +98,7 @@ createLogger(sink: LogSink | undefined, debugEnabled = false): Logger
 | `publish/register` | info | `models` | 首次注册 provider |
 | `publish/replace` | info | `models` | 换名册（先释放再注册） |
 | `publish/replace-failed` | error | `message` | 释放后注册失败 → provider 短暂消失 |
-| `publish/release` | info | `reason` | 主动释放（三元门控关掉） |
+| `publish/release` | info | `reason` | 主动释放（三元门控关掉，或换名册前的释放） |
 | `publish/dispose` | info | `reason` | 卸载时释放 |
 | `publish/dispose-threw` | debug | `message` | 重复 dispose（正常，降级成 debug） |
 
@@ -104,9 +107,24 @@ createLogger(sink: LogSink | undefined, debugEnabled = false): Logger
 | 事件 | 级别 | 字段 | 说明 |
 | --- | --- | --- | --- |
 | `catalog/loaded` | info | `models` | 目录拉到了 |
-| `catalog/failed` | warn | `kind`, `message` | 目录失败（AUTH 时会 `markDead`） |
+| `catalog/failed` | warn | `kind`, `message` | 目录失败（AUTH 时**可能** `markDead`：号池在服务时不判死，见 §4.1） |
 | `quota/failed` | warn | `message` | 余额失败（不致命） |
 | `probe/vision` | info | `model`, `verdict`(`yes`/`no`/`unknown`) | 识图探测结果 |
+
+**号池（`src/host/index.ts`，ADR-0010）**
+
+| 事件 | 级别 | 字段 | 说明 |
+| --- | --- | --- | --- |
+| `pool/add` | info | `id`(前 8 位), `source`, `total` | 加号成功（导入或扫码） |
+| `pool/add-no-principal` | warn | `source` | 凭据里没有 principal，拒绝入池 |
+| `pool/add-start` | info | `phase` | 号池「扫码添加」开始 |
+| `pool/pick` | info | `id`(前 8 位), `candidates` | **换号时**打一条（粘住期间不重复） |
+| `pool/measure` | info | `id`, `state`, `status` | 测量值落盘时打（`ok`→`ok` 被 `shouldPersistMeasure()` 拦掉，连日志都不打） |
+| `pool/toggle` | info | `id`, `enabled` | 勾选 / 取消某个号 |
+| `pool/remove` | info | `id`, `total` | 移除某个号 |
+| `pool/checkin` | info | `total`, `granted`, `already`, `failed` | 一键签到汇总（**每号一行结果只进 HTTP 响应，不进日志**） |
+| `pool/test` | info | `id`, `state`, `status` | 手动测试某个号 |
+| `pool/write-failed` | error | `message` | `accounts.json` 写失败（`toggle` 会回滚内存，`remove` 不回滚） |
 
 **动作与路由（`src/host/index.ts` / `src/host/routes.ts`）**
 
@@ -290,18 +308,21 @@ UI 拿到 `status.build` 与自己的 `BUILD` 常量对比，不一致就在标�
 
 | 场景 | 间隔 |
 | --- | --- |
-| 空闲（无登录中） | 20 s |
-| 设置卡打开 + 登录中 | 1.5 s |
-| 出错后 | 30 s → 60 s 退避 |
+| 登录中（`pending` / `logging`） | 1.5 s（`POLL_LOGIN_MS`） |
+| 其余一切（含 `expired` / `error` / 宿主不可达） | 20 s（`POLL_IDLE_MS`） |
 | 页面重新可见（`visibilitychange`） | 立刻拉一次，然后回正常节奏 |
 
 实现要点：
 
 - **共享一个 store**：多个组件订阅同一份快照，只有一个 setTimeout 链
-- **`inflight` 去重**：并发 `load()` 只发一次请求
+- **`inflight` 去重 + 补跑**：并发 `load()` 只发一次请求；在飞时进来的那次不丢，置
+  `reloadWanted`，本轮返回后再补一次（2026-11-11 修 —— 早先直接 `return`，
+  `act()` 结尾那次刷新撞上轮询就被静默丢弃，用户点完按钮看不到变化）
 - **失败保留上一份快照**：不要因为一次网络抖动把界面清空
 - **第一个订阅者启动轮询，最后一个退出时停**：没有组件在用时不该继续打端点
-- **失焦暂停**：`document.visibilityState === "hidden"` 时不排下一次
+- **不做指数退避、不因失焦暂停**：宿主挂了就按 20 s 继续试（浏览器在后台本来就会降频），
+  切回可见时补拉一次。早期设计稿写的"出错后 30 s → 60 s"与"失焦暂停"都**没有实现**，
+  这里按代码回填。
 
 ### 3.1 药丸不显示错误
 
@@ -315,27 +336,38 @@ UI 拿到 `status.build` 与自己的 `BUILD` 常量对比，不一致就在标�
 
 ## 4. 诊断块
 
-### 4.1 十三行（2026-11-06 `npm run smoke` 的真实输出）
+### 4.1 十四行（2026-11-11 真宿主 `GET /plugins/dsh-raccoon-web/status` 的真实输出）
 
 ```
 插件: dsh-raccoon-web 0.1.0
-build: 2026-11-06T12:35
-平台: win32 / node v24.22.1
-登录: none
-来源: -
-桌面端: 未读到 (未找到桌面客户端登录态，已回退到扫码)
-账号: -
-provider: not-configured
-目录: 未就绪
-余额: 未知
-上下文上限: 128000
+build: 2026-11-11T23:05
+平台: win32 / node v24.21.0
+登录: ready (access_token)
+来源: 官方客户端凭据
+桌面端: 已读到 (C:\Users\Administrator\.office-raccoon\agent\config\auth.json)
+账号: pu-01a19
+provider: published
+目录: 6 个模型
+余额: 383
+上下文上限: 1000000
 思考: 开
 扫码协议: Web auth（官方桌面端同款）
+号池: 关（池空）
 ```
 
-**固定 13 行，不随登录状态增删。** 未知值用 `-` / `未知` / `未读到 (原因)` 占位，行数恒定 —— 这样用户截图对比时不会数错。
+第 14 行「号池」由 `status.ts` 的 `poolLine()` 生成，五种形态：
 
-顺序由 `src/host/status.ts:133-147` 的 `lines[]` 定死，改顺序要同步改单测 ST-25 的 `assert.equal(text.split("\n").length, 13)`。
+| 开关 | 池状态 | 文案 |
+| --- | --- | --- |
+| 关 | 池空 | `关（池空）` |
+| 关 | 有账号 | `关（N 个账号，未启用自动换号）` |
+| 开 | 池空 | `开（池空）` |
+| 开 | 0 个启用 | `开（N 个账号，0 个启用）` |
+| 开 | 有启用 | `开（N 个启用，当前 xxxxxxxx）`（`activeId` 前 8 位） |
+
+**固定 14 行，不随登录状态增删。** 未知值用 `-` / `未知` / `未读到 (原因)` 占位，行数恒定 —— 这样用户截图对比时不会数错。
+
+顺序由 `src/host/status.ts` 的 `lines[]` 定死，改顺序或增删行要同步改单测 ST-25 / ST-25b / ST-25c 的 `assert.equal(text.split("\n").length, 14)`。
 
 登录就绪后同一份样例会变成：
 

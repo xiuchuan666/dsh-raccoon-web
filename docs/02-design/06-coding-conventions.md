@@ -122,17 +122,14 @@ count++;
 ## 5. 错误
 
 ```ts
-throw new RaccoonError({
-  kind: "AUTH",
-  status: 401,
-  message: "小浣熊登录已失效，请在设置 → 插件 → 小浣熊 里重新扫码。",
-  upstream: text,
-});
+throw new RaccoonError("AUTH", "小浣熊登录已失效", { status: 401, upstream: text });
 ```
 
-- `message` 是**给用户看的中文**，不是 `"unauthorized"`。
+- 构造签名是**位置参数** `(kind, message, options?)`，不是 options 对象 —— 早先文档里写成对象形式，与实现不符（2026-11-11 更正）。
+- `message` 是**给用户看的中文**，不是 `"unauthorized"`。**下一步做什么**放在 `hint`（默认取 `HINTS[kind]`，特殊情况用 `options.hint` 覆盖），`userText` 把两者拼起来。
 - `upstream` 是原始文本，**只进日志**。
 - 一个错误的 `message` 里不能有 token、不能有完整 URL（含 query 的）。
+- **`message` / `hint` 里不能出现 `400` / `401` / `403` / `429` / `5xx` / `timeout` / `rate limit`** —— `classifyPiAiError()` 按文本正则分类，写了会被重新归类（见 `docs/01-research/04-dsh-kernel-api.md` 的十级正则表）。
 
 ---
 

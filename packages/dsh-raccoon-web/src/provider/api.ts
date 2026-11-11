@@ -42,6 +42,14 @@ type ApiLike = ReturnType<typeof openAICompletionsApi>;
  */
 interface LooseOptions {
   onPayload?: (params: Record<string, unknown>, model: unknown) => unknown;
+  /**
+   * pi-ai 在拿到响应头之后调它（`openai-completions.js:202`）。
+   *
+   * **只能拿到 `{status, headers}`，拿不到 body。** 号池记测量靠它 ——
+   * 状态码足够区分 401/402/429/5xx，body 关键词（`200429`、余额不足文案）
+   * 只能在错误路径上补。
+   */
+  onResponse?: (info: { status: number; headers: unknown }, model: unknown) => unknown;
   reasoningEffort?: string;
   [k: string]: unknown;
 }
@@ -67,13 +75,17 @@ function withExtraBody(
  * 注意 `onPayload` 可能是上游已经设了的（目前 `PiAiAdapter` 不设，但别把
  * 这个假设写死）—— 先让它跑完，再在我们的结果上追加 extra_body。
  */
-export function createRaccoonApi(reasoningEffortOf?: (model: unknown) => string | undefined): ApiLike {
+export function createRaccoonApi(
+  reasoningEffortOf?: (model: unknown) => string | undefined,
+  onStatus?: (status: number) => void,
+): ApiLike {
   const inner = openAICompletionsApi();
 
   const wrap =
     (method: "stream" | "streamSimple") =>
     (model: unknown, context: unknown, options: LooseOptions = {}) => {
       const upstreamOnPayload = options.onPayload;
+      const upstreamOnResponse = options.onResponse;
       const effort = options.reasoningEffort ?? reasoningEffortOf?.(model);
 
       const injected: LooseOptions = {
@@ -88,6 +100,24 @@ export function createRaccoonApi(reasoningEffortOf?: (model: unknown) => string 
             }
           }
           return withExtraBody(base, effort);
+        },
+        /**
+         * 号池记测量的唯一通路。
+         *
+         * **不能抛**：这是 pi-ai 的响应处理路径，抛错会把一次正常请求变成失败。
+         * 上游的 `onResponse`（如果有）先跑，我们的回调包在 try/catch 里。
+         */
+        onResponse: (info: { status: number; headers: unknown }, m: unknown) => {
+          if (typeof upstreamOnResponse === "function") {
+            upstreamOnResponse(info, m);
+          }
+          if (onStatus !== undefined) {
+            try {
+              onStatus(info.status);
+            } catch {
+              // 记测量失败绝不影响请求。
+            }
+          }
         },
       };
 

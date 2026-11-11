@@ -71,8 +71,10 @@ export const LOGIN_TIMEOUT_MS = 330_000;
 /**
  * 单请求图片像素预算。
  *
- * 网关单请求体上限约 10MB（超了 HTTP 413）。sensenova 用 640 000，
- * 这个数字是它实测调出来的，沿用。
+ * 网关单请求体上限实测约 **3.0001 MiB**（E-019：3,145,600 通 / 3,145,700 拒），
+ * 不是早期猜的 10 MB。sensenova 用的 640 000 像素约合 800×800，
+ * 单张 PNG 压缩后通常 200 KB~1.5 MB —— 在 3 MiB 下最多放两张，三张以上大图会先撞体积。
+ * 沿用 640 000，但把上限理由改对：防撞的是 3 MiB，不是 10 MB。
  */
 export const IMAGE_PIXEL_BUDGET = 640_000;
 
@@ -98,3 +100,39 @@ export const DATA_DIR = "raccoon-web";
 
 /** 默认上下文上限。见 docs/02-design/03-state-and-storage.md §5。 */
 export const DEFAULT_CONTEXT_CAP = 128_000;
+
+// ───────────────────────────── 号池（ADR-0010） ─────────────────────────────
+
+/**
+ * 每日积分领取的写接口。**E-036 实测 200，且幂等。**
+ *
+ * 注意路径前缀是 `desktop/v1`，不是 `points/v1` —— 它挂在桌面端登录域下，
+ * 不在积分域下。这是 asar 逆向出来的，别按"积分都在 POINTS_BASE 下"去猜。
+ */
+export const GRANT_PATH = `${WEB_BASE}/desktop/v1/login/points/grant`;
+
+/** 号池账号文件（在 `dataDir()` 下）。 */
+export const POOL_FILE = "accounts.json";
+
+/**
+ * 被限流后的冷却时长。
+ *
+ * 上游给了重置时间就按它算；没给才用这个兜底。
+ * **不要编造倒计时** —— workbuddy 的教训：编出来的时间会让用户
+ * 在一个其实已经可用的号上白等。
+ */
+export const POOL_COOL_LIMITED_MS = 30 * 60_000;
+
+/** 网络/超时失败后的冷却时长。同上，没拿到上游提示时的兜底。 */
+export const POOL_COOL_FLAKY_MS = 30 * 60_000;
+
+/**
+ * 余额读数的"新鲜"窗口。
+ *
+ * 超过这个时间的读数**不参与排序** —— 排序不能为了排序去打上游。
+ * 10 分钟是 workbuddy 的量级，实测够用（它也是 10 分钟）。
+ */
+export const POOL_QUOTA_FRESH_MS = 10 * 60_000;
+
+/** 设备身份前缀。上游要的是"真实 install ID"，形状不重要，稳定性才重要。 */
+export const POOL_DEVICE_PREFIX = "raccoon-";

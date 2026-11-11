@@ -1,5 +1,5 @@
 /**
- * HTTP 路由：状态快照 + 八个 action。
+ * HTTP 路由：状态快照 + 十四个 action（`?action=` 分发，见 `host/index.ts` 的 `runAction()`）。
  *
  * ## 为什么走 HTTP 而不是别的
  *
@@ -18,8 +18,8 @@
  * ## 为什么 action 用 `?action=` 而不是路径
  *
  * `webServer.register({kind:"exact", path})` 是精确匹配（不支持 `:param`）。
- * 想用 RESTful 路径就得注册八条路由，八条路由各自要挂 `ctx.effect`。
- * 一个 query 参数换八条路由，划算。
+ * 想用 RESTful 路径就得为每个 action 注册一条路由，每条各自要挂 `ctx.effect`。
+ * 一个 query 参数换十四个 action 共用两条路由，划算。
  *
  * @module host/routes
  */
@@ -214,6 +214,7 @@ export function loginBlock(snapshot: LoginSnapshot, token: { principal?: string;
   qrSvg?: string;
   deadline?: number;
   message?: string;
+  mode?: LoginSnapshot["mode"];
   principal?: string;
   kind?: "access_token" | "xhx_token";
   expiresAt?: number;
@@ -223,6 +224,8 @@ export function loginBlock(snapshot: LoginSnapshot, token: { principal?: string;
   if (snapshot.qrSvg !== undefined) out.qrSvg = snapshot.qrSvg;
   if (snapshot.deadline !== undefined) out.deadline = snapshot.deadline;
   if (snapshot.message !== undefined) out.message = snapshot.message;
+  // 前端靠它分辨"这张二维码是主登录的还是加池成员的"，两个区各自认领。
+  if (snapshot.mode !== undefined) out.mode = snapshot.mode;
   if (token?.principal !== undefined) out.principal = token.principal.slice(0, 8);
   if (token?.kind !== undefined) out.kind = token.kind;
   if (token?.expiresAt !== undefined) out.expiresAt = token.expiresAt;

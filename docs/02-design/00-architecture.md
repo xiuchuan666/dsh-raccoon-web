@@ -26,7 +26,7 @@
 │  │   ├ publish.ts   三元门控 → registerAdapter                  │  │
 │  │   ├ cache.ts     TtlCache（inflight 去重）                   │  │
 │  │   ├ solid-png    3×3 纯红 PNG（识图探测）                    │  │
-│  │   └ status.ts    快照 + 13 行诊断                            │  │
+│  │   └ status.ts    快照 + 14 行诊断                            │  │
 │  │    ↓                                                        │  │
 │  │  provider/                                                  │  │
 │  │   ├ api.ts       createRaccoonApi = 包装 openAICompletionsApi│  │
@@ -57,7 +57,7 @@
                               ↕ HTTP（loopback，仅 JSON）
 ┌──────────────────────────────────────────────────────────────────┐
 │ DSH 浏览器半身（client.js，手写 classic script）                   │
-│  conversation.input.left  → 积分药丸（20s 轮询 / 失焦暂停）        │
+│  conversation.input.left  → 积分药丸（20s 轮询）                   │
 │  plugins.bundle.config    → 设置卡（登录 / 余额 / 模型 / 诊断）     │
 │  **只调 /status 与 /action，永不接触 token**                       │
 └──────────────────────────────────────────────────────────────────┘
@@ -100,7 +100,7 @@ grep -rn "@deepseek-ai\|@earendil-works" packages/dsh-raccoon-web/src/protocol/ 
 grep -rn "from \"\.\./host\|from \"\./host" packages/dsh-raccoon-web/src/provider/ # 必须零命中
 ```
 
-**收益是实的**：168 个单测里，`qr` / `iam` / `web-auth` / `catalog` / `chat` / `points` / `desktop-auth` 全部在不启动 DSH 的情况下跑，靠一个 30 行的 ESM loader 钩子把 `./x.js` 映射到 `x.ts`。
+**收益是实的**：220 个单测里，`qr` / `iam` / `web-auth` / `catalog` / `chat` / `points` / `desktop-auth` / `pool` 全部在不启动 DSH 的情况下跑，靠一个 30 行的 ESM loader 钩子把 `./x.js` 映射到 `x.ts`。
 
 ---
 
@@ -125,7 +125,7 @@ grep -rn "from \"\.\./host\|from \"\./host" packages/dsh-raccoon-web/src/provide
 
 - `/status` 返回的 `login` 块只有 `phase` / `source` / `principal`（前 8 位）/ `kind` / `expiresAt` / `message`
 - 日志只打 `tokenTag()` = `sha256(token).slice(0,8)`
-- 诊断块 13 行里没有 token
+- 诊断块 14 行里没有 token
 - `buildDiagnostics()` 有单测断言"不含 `eyJ`"（JWT 的 base64 前缀）
 
 理由：浏览器半身运行在 renderer 里，任何 `window` 上的东西都可能被 devtools、扩展、剪贴板工具拿到。而 token 是一个能直接花这个账号积分的 bearer。
@@ -216,7 +216,8 @@ settings.authSource
 | --- | --- | --- |
 | 来源 | `~/.office-raccoon/agent/config/auth.json`（只读） | 本插件 `LoginFlow` |
 | 落盘 | **不落盘，只在内存** | `$DSH_HOME/state/dsh-raccoon-web/token.json`（0600） |
-| 有效期 | IAM JWT ~30 天，**过期不能自动续** | 同左（IAM token 无 refresh grant） |
+| 有效期 | IAM JWT ~30 天，**过期不能自动续** | 同左 |
+| 为什么不能自动续 | 续期接口存在（`/api/web/auth/v1/refresh`），但 refresh 会 rotate，一 rotate 就把官方客户端踢下线；且官方桌面端自己也不调它。见 E-037 | 同左（不做，理由同上） |
 | "退出登录" | 只是本会话不再读（凭据归客户端管） | 删文件 |
 | 客户端换账号 | 我们下次启动自动跟着变（因为不落盘） | 不受影响 |
 
@@ -309,7 +310,7 @@ export function apply(ctx) {              // 同步返回，不能 await
 | --- | --- | --- |
 | 没有桌面端凭据、也没扫码 | 卡片显示"未读到客户端登录态"+ 两个按钮并列 | `publish: not-configured`，`models` 仍是 5 条 fallback（**刻意的**，不然用户以为插件坏了） |
 | 凭据过期 | "官方客户端的登录态已过期：打开客户端重新登录一次，或改用扫码。" | `phase: expired` |
-| 目录拉取 401 | 同"登录已失效" | 清 catalog/quota 缓存，**不删 token**（可能只是抖动） |
+| 目录拉取 401 | 同"登录已失效" | 清 catalog/quota 缓存，**不删 token**（可能只是抖动）；**号池在服务时不判死主登录**（坏的是池成员，`recordMeasure()` 已经把它标 `dead` 并换号） |
 | 上游限流 | 长文案（按 token 速率、不是每分钟请求数） | `RATE_LIMIT`，**不重试**（重试只延长冷却） |
 | 首字节 60s | "小浣熊响应超时…" | 重试 2 次（`SERVER`/`TIMEOUT`/`TRANSPORT`/`EMPTY_RESPONSE`） |
 | 宿主卸载 | 界面元素消失 | 路由 / adapter / 定时器 / 订阅全部释放 |

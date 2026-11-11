@@ -51,9 +51,11 @@ status === 401 || status === 403 || payload.code === 200001 || payload.code === 
 
 **文案**：
 
-> 小浣熊登录已失效，请在设置 → 插件 → 小浣熊 里重新扫码。
+> 小浣熊登录已失效。如果用的是官方客户端账号，打开官方客户端重新登录即可；如果是扫码登录的，在设置 → 插件 → 小浣熊 里重新扫码。
 
-**别写**"未授权"、"Authentication failed"、"请检查 API Key" —— 这个插件没有 API Key，只有扫码。
+**2026-11-11 更正**：这里原来只写"请在设置 → 插件 → 小浣熊 里重新扫码"。那句话对**只读官方客户端凭据**的用户是错的引导 —— 他从来没扫过码，该做的是打开客户端让它自己续（ADR-0008 只读不代持，我们续不了）。协议层（`errors.ts` 的 `HINTS.AUTH`）**不知道**当前用的是哪种凭据（`fetchCatalog` / `chatStream` 只拿到 token 字符串），所以两条路都写；知道 `token.source` 的那一层（`host/index.ts` 的 `refreshCatalog()`）给的是精确文案。
+
+**别写**"未授权"、"Authentication failed"、"请检查 API Key" —— 这个插件没有 API Key，只有"客户端凭据"和"扫码 token"两种身份。
 
 ### 2.2 `RATE_LIMIT`
 

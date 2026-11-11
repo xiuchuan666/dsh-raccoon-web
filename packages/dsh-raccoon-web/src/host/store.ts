@@ -115,8 +115,11 @@ async function ensureDir(dir: string): Promise<void> {
  *
  * 失败**向上抛**：调用方决定"写不进去"是不是致命。token 写失败要告诉用户
  * （否则扫码成功但重启就没了），probe 写失败则无所谓。
+ *
+ * 导出是为了让 `pool.ts` 复用同一套原子写（temp 名规则、`0600`、rename），
+ * 而不是再抄一遍 —— 抄一遍就会出现"号池的写不是原子的"这种没人会发现的问题。
  */
-async function writeJson(file: string, value: unknown): Promise<void> {
+export async function writeJson(file: string, value: unknown): Promise<void> {
   const dir = dirname(file);
   await ensureDir(dir);
   const temp = temporaryOf(dir, basename(file));
@@ -130,7 +133,7 @@ async function writeJson(file: string, value: unknown): Promise<void> {
 }
 
 /** 读一个 JSON 文件。不存在 / 损坏 / 非对象 → `undefined`，**永不抛**。 */
-async function readJson(file: string): Promise<unknown> {
+export async function readJson(file: string): Promise<unknown> {
   try {
     const text = await readFile(file, "utf8");
     const parsed: unknown = JSON.parse(text);
@@ -162,6 +165,10 @@ export async function readToken(): Promise<StoredToken | undefined> {
     ...(typeof raw.expiresAt === "number" ? { expiresAt: raw.expiresAt } : {}),
     ...(typeof raw.principal === "string" ? { principal: raw.principal } : {}),
     ...(typeof raw.account === "string" ? { account: raw.account } : {}),
+    // `source` 之前漏展开：磁盘读回来的 token 永远 `source === undefined`，
+    // 于是"这份凭据是扫码来的还是桌面端来的"在读回之后就丢了。
+    // 旧文件（没有这个键）继续当作 `qr` —— 与 `source` 字段注释里的约定一致。
+    ...(raw.source === "qr" || raw.source === "desktop" ? { source: raw.source } : {}),
   };
 }
 

@@ -1,13 +1,19 @@
 # 未解问题与验证方法
 
-最后更新: 2026-11-06
+最后更新: 2026-11-11
 状态: 已定稿（持续追加）
 
 > 每条问题都必须带**可执行的验证方法**。写"待研究"等于没写。
+>
+> **2026-11-11 复核**：Q1 / Q2 / Q3 / Q4 / Q5 / Q7 / Q8 / Q9 都已解，标题后标了结论。**只有 Q6 与 Q10 仍开放**，且都不是"网关行为未知"，而是"我们的选择还没被现实证伪"。
 
 ---
 
-## Q1 · SSE error frame 的真实形状（P0）
+## Q1 · SSE error frame 的真实形状（**已解：三种都容忍**）
+
+**结论**：`src/protocol/errors.ts` 的 `isRaccoonRateLimited(status, text)` 同时覆盖 A/B/C 三种 —— 看状态码 + 全文关键词，对 200 流把整帧 JSON 序列化后跑关键词匹配；`RATE_LIMIT_CODES = new Set([429, 200429])`。唯一没观测过的是"真的在流中间撞限流"，但不阻塞实现。
+
+### 原始记录（保留）
 
 **问题**：限流发生在流中间时，帧长什么样？三种可能：
 
@@ -40,7 +46,13 @@ grep -n -E 'error|code|rate' /tmp/sse-raw.txt
 
 ---
 
-## Q2 · `x-client-platform` / `x-client-version` 是否必需（P0）
+## Q2 · `x-client-platform` / `x-client-version` 是否必需（**已解：LLM 端点官方只发 `Authorization` + 条件性 `X-Org-Code`**）
+
+**结论（E-034）**：拆官方 asar 实测 —— 官方 LLM 请求头只有 `Authorization` 与条件性的 `X-Org-Code`（`office_identity !== "personal"` 才带）；asar 里 `x-raccoon-language` / `x-client-version` / `x-client-platform` **零命中**。我们补的三个头无官方依据，但带不带都 200、无可观测差异 → 保留（成本为零）。
+
+**注意区分**：积分/签到接口（`desktop/v1/login/points/grant`）官方**确实**发 `X-Client-Platform` / `X-Client-Version` / `X-Org-Code`（E-036 的 asar 原文）。"官方不发"这句只对 LLM 对话端点成立。
+
+### 原始记录（保留）
 
 **问题**：sensenova 的浣熊 provider 不带这两个头也能用；`dsh-llm-adapters` 带。到底必需吗？
 
@@ -69,7 +81,13 @@ done
 
 ---
 
-## Q3 · `extra_body.thinking` 是否仍被接受（P0）
+## Q3 · `extra_body.thinking` 是否仍被接受（**已解：接受，且是最有效的关思考开关**）
+
+**结论（E-035 五变体 A/B）**：`extra_body.thinking: {type:"disabled"}` 把 reasoning 从基线 260 字符压到 81；顶层 `thinking` 压到 49；`enable_thinking:false` **无效**（389，正文还空）；`reasoning_effort:"none"` 压到 82。**关掉思考仍会回吐少量 `reasoning_content`**（几十字符），UI 必须容忍。
+
+**当前实现**：包装 `openAICompletionsApi()`，在 `onPayload` 里注入 `extra_body.thinking`（`src/provider/api.ts`，68 行）。
+
+### 原始记录（保留）
 
 **问题**：网关还认 `extra_body` 吗？还是改成了 `thinking` 顶层字段 / `enable_thinking`？
 
@@ -97,7 +115,18 @@ done
 
 ---
 
-## Q4 · 目录响应的完整字段（P1）
+## Q4 · 目录响应的完整字段（**已解：三处嵌套陷阱，见 E-032**）
+
+**结论（E-032）**：真实形状与我们早期猜的不一样，四处硬规矩：
+
+1. `context_window` / `max_tokens` 在 **`params` 里面**（`m.params.context_window`），不在顶层
+2. 显示名在 **`description`** 里 —— `name` 与 `model_name` **都是 id**
+3. 倍率在 `billing_effective_multiplier`（真实生效）与 `billing_multiplier`（标价）
+4. 分组对象只有 `{type:"chat", default_model}`，**没有 key / name** → groupKey 只能取 `type`
+
+`src/protocol/catalog.ts:169` 已按此解析（`sn-deepseek-v4-1-flash-1017` 的 1,000,000 就是从 `params.context_window` 读出来的）。
+
+### 原始记录（保留）
 
 **问题**：`context_window` 还是 `contextWindow`？`max_output_length` 还是 `max_tokens`？`multiplier` 是数字还是字符串？
 
@@ -123,22 +152,18 @@ const contextWindow =
 
 ---
 
-## Q5 · 图片是 base64 还是也接受 URL（P1）
+## Q5 · 图片是 base64 还是也接受 URL（**已解，E-018**）
 
-**问题**：`image_url.url` 能不能是 `https://...`？
+**结论（2026-11-11 实测）**：**两种都支持**。
 
-**为什么要紧**：如果只吃 base64，大图会撞 10 MB 上限，必须先在本地压。
+- `https://httpbin.org/image/png` → 200，模型认出 "an image of a cartoon pig face"
+- `data:image/png;base64,<真 PNG>` → 200，reasoning "a solid bright …"
+- **裸 base64（不带 `data:` 前缀）→ 400 `image download failed`** —— 它会被当成 URL 去下载
+- google logo / wikimedia 的 URL 都回 `400 image download failed`（30.3s / 10.4s）—— 那是**服务端下载不到**，不是"不支持 URL"。第一轮差点据此写错结论
 
-**验证**：
+**体积上限**：约 **3.0001 MiB**（E-019），不是曾经猜的 10 MB；超限回 `400 inference request is invalid`，**永远不会有 413**。
 
-```bash
-# A. data URL
-'{"role":"user","content":[{"type":"text","text":"图里是什么字"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KG..."}}]}'
-# B. https URL
-'{"role":"user","content":[{"type":"text","text":"图里是什么字"},{"type":"image_url","image_url":{"url":"https://example.com/x.png"}}]}'
-```
-
-**当前实现**：只发 base64（DSH 的附件本来就是本地文件，转 base64 是必然路径）。像素预算 640 000。
+**当前实现**：只发 base64（DSH 的附件本来就是本地文件，转 base64 是必然路径），像素预算 640 000 —— 单张 PNG 压缩后通常 200 KB~1.5 MB，两张以内安全。
 
 ---
 
@@ -154,7 +179,11 @@ const contextWindow =
 
 ---
 
-## Q7 · `v1.0.35` 版本号是否被校验（P2）
+## Q7 · `v1.0.35` 版本号是否被校验（**已解：不校验，随便填都 200**）
+
+**结论**：E-034 实测 —— 目录、对话、余额、流水、user_info 五个端点在带不带 `x-client-version` 两种情况下都是 200，无可观测差异。所以常量 `v1.0.35` 只是一个"看起来像官方"的字符串，抽在 `src/protocol/consts.ts` 里改一处生效。
+
+### 原始记录（保留）
 
 **验证**：
 
@@ -176,15 +205,21 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
 
 ---
 
-## Q9 · 每日积分到底怎么触发（P2）
+## Q9 · 每日积分到底怎么触发（**已解：有签到接口，E-036**）
+
+**结论（E-036）**：`POST /api/web/desktop/v1/login/points/grant`（**无 body**）就是官方客户端的领取动作。幂等 —— 连续两次都是 200 `{"code":0,"message":"success","data":{"granted":false,"popup":null}}`，`granted:false` 表示今日已领。asar 原文里官方判 `0 === n.code && n.data?.granted` 才弹 `SHOW_POINT_GRANT_POPUPS`。
+
+**当前实现**：`src/protocol/points.ts` 的 `grantDaily()` + 号池的「一键签到」（`pool-checkin`）。**先查后写**（先看 `bills` 里今天有没有 `daily_grant`），单个账号失败不中断，**与自动换号开关无关**。
+
+**仍未实测**：真的领到的那一次（`granted:true`）。当日已领，要等次日北京零点后。这是"没验过的分支"，不是"不知道接口在哪"。
+
+### 原始记录（保留）
 
 **已知**：没有签到接口；`setting_info` 的 `point_grant_popups` 公告发放；重放 `setting_info` 能触发。
 
 **不解**：是"打开网页"触发，还是"打开网页且页面加载完 setting_info"触发？纯 API 调用（我们的插件）算不算？
 
 **验证**：连续 3 天不动网页，只用插件查余额，看 `daily_points` 是否增长。
-
-**当前决定**：只读展示，不代领。理由见 [03-raccoon-protocol.md §4.3](03-raccoon-protocol.md)。
 
 ---
 
@@ -197,6 +232,23 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
 **验证**：改一个字 → 重启 DSH → 刷新页面 → 看是否生效。
 
 **处置**：开发期在 `client.js` 顶部加一个 `const BUILD = "2026-11-06T09:40";`，日志里打出来，用于确认浏览器加载的是新版。
+
+---
+
+## Q11 · 桌面端凭据过期后能不能自动续（**已解：不做，E-037**）
+
+**问题**：`POST /api/web/auth/v1/refresh` 存在，能不能拿它把 `auth.json` 里的 token 换新，省掉用户手动打开官方客户端？
+
+**结论（四轮探针）**：
+
+1. asar 里这个 URL **只出现 1 次**（offset 74078848），且是 SDK 文档段落（`callScore = 0` / `docScore = 1`）—— **官方桌面端自己也不调它**
+2. body 字段名是 **`token`**（`{}` 空对象也报 `param token invalid format invalid`，说明它在报"格式"不是"缺失"）
+3. 17 种候选形状（32/64 hex、UUID、`rt_` 前缀、432 字符 base64url、纯数字…）**全部同一条 `100002`** —— 格式校验无法从外部暴力猜出
+4. **即便猜出来也不用** —— refresh 很可能 rotate，一 rotate 就把用户正开着的官方客户端踢下线
+
+**当前决定**：**不做自动续期**。凭据过期时 `desktopAuth.reason` 直接写"客户端凭据已过期，请打开官方客户端刷新"，UI 照原样显示两个登录入口。这是一条**有证据的"不做"**。
+
+⚠️ ADR-0008 里"IAM 没有 refresh grant"这句在**事实层面是错的**（接口存在），但在**决策层面仍然成立**（理由是 rotate 风险，不是"没有接口"）。下次回来别把"没找到"当"不存在"，也别把"找到了"当"该做"。
 
 ---
 

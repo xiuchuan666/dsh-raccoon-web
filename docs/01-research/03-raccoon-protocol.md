@@ -540,11 +540,33 @@ function isRateLimited(status, text) {
 
 **注意**：真链路的 60s 首字节超时**目前不在 pi-ai 通路上生效**（`dsh-llm-pi-ai` 的 `profileOptions()` 不透传 `onPayload` 之外的钩子，也不支持首字节超时）。真正生效的是 `profile.streamIdleTimeoutMs = 300_000`（帧间 idle）。这是已知的差距，记在 `06-open-questions.md`。
 
-### 4.7 图片
+### 4.7 图片（E-018 已实测）
 
-- 请求体上限 ~10 MB → 超了 `HTTP 413` → 归到 `INVALID_REQUEST`
-- **像素预算下调到 640_000**（`IMAGE_PIXEL_BUDGET`）。默认预算会撞 10 MB 上限
-- ⚠️ **仍缺实测**（E-018）：图片是否必须 base64 data URL，还是也接受 https URL
+`messages[].content` 里的形状：
+
+```ts
+{ type: "image_url", image_url: { url: string } }
+```
+
+`url` 可以是两种（**2026-11-11 实测，两种都通**）：
+
+| 形式 | 结果 | 说明 |
+| --- | --- | --- |
+| `data:image/png;base64,<真 PNG>` | **200**，模型说得出颜色 | 首选。DSH 传下来的图片（粘贴/上传）就是这个形式 |
+| `https://…/x.png` | 视目标站可达性而定 | **服务端自己去下载**。httpbin 成功（200，3459ms）；google / wikimedia 失败（`400 image download failed`，30.3s / 10.4s） |
+| 裸 base64（无 `data:` 前缀） | **400** `image download failed` | 233ms 就回 —— 它把这串 base64 当 URL 去下载了 |
+
+要点：
+
+1. **`image download failed` 是"我们这边下载不到那个 URL"，不是"不支持 URL"。** 报错文案必须写清这一点，否则用户会以为插件不支持识图。
+2. **base64 必须带 `data:image/<mime>;base64,` 前缀。**
+3. 所有图片相关的失败都是 `400 invalid_request_error`，`code` 与"参数非法 / 图太大"共用，**只能靠 `message` 区分**（`image download failed` / `invalid image base64 content` / `inference request is invalid`）。
+
+**体积预算**（E-019 实测）：
+
+- 请求体硬上限 **约 3.0001 MiB**（3,145,600 通 / 3,145,700 拒，多次重跑稳定），**不是 10 MB**。
+- 超限返回 **`400 inference request is invalid`，不是 `413`** —— 按 413 做分支是死代码。
+- 所以 `IMAGE_PIXEL_BUDGET` 从"防撞 10 MB"改成"防撞 3 MiB"。当前实现取 `640_000` 像素预算，单张 PNG 压缩后通常 200 KB~1.5 MB，两张以内安全；三张以上大图会先撞 3 MiB 而不是撞 token。
 
 ---
 
@@ -679,10 +701,11 @@ Authorization: Bearer <token>
 
 | 来源 | 码 | 含义 | kind | 可重试 | 用户文案 |
 | --- | --- | --- | --- | --- | --- |
-| HTTP | 401 `200001` | 没带 token | `AUTH` | ✗ | 小浣熊登录已失效，请重新扫码 |
+| HTTP | 401 `200001` | 没带 token | `AUTH` | ✗ | 小浣熊登录已失效（桌面端凭据 → 打开官方客户端重登；扫码 → 重新扫码） |
 | HTTP | 401 `200003` | token 无效/过期（**会话死亡码**） | `AUTH` | ✗ | 同上 |
 | HTTP | 403 | 无权限 | `AUTH` | ✗ | 同上 |
-| HTTP | 413 | 请求体过大 | `INVALID_REQUEST` | ✗ | 图片太大/数量太多 |
+| HTTP | 413 | 请求体过大 | `INVALID_REQUEST` | ✗ | **实际不会出现** —— 见下一行 |
+| HTTP | 400 `inference request is invalid` | **请求体超 ~3 MiB**（E-019） | `INVALID_REQUEST` | ✗ | 请求体超过上游约 3 MiB 上限，请减少图片或缩短上下文 |
 | HTTP | 429 | 限流 | `RATE_LIMIT` | ✗ | 见 §4.5 |
 | HTTP | 5xx | 上游故障 | `SERVER` | ✅ | 小浣熊服务端出错了 |
 | 流内 | `200429` | 限流（HTTP 200 里） | `RATE_LIMIT` | ✗ | 见 §4.5 |
@@ -759,16 +782,20 @@ POST /api/web/auth/v1/login_with_authorization_code {code}
 
 ---
 
-## 10. 仍缺的实测
+## 10. 实测覆盖状态（E-001 ~ E-039 全部收口）
 
-| # | 问题 | 验证方法 | 优先级 |
+2026-11-11 之后**已无待补的实测项**。下面这张表是"曾经的缺口 → 现在的结果"，留着是为了下次有人怀疑某条假设时能直接跳到证据。
+
+| # | 原问题 | 结论 | 证据 |
 | --- | --- | --- | --- |
-| **E-018** | 图片必须 base64 data URL，还是也接受 https URL | 两种各发一次 | P1 |
-| **E-019** | `413` 的确切阈值（10 MB？含 base64 膨胀？） | 逐步加大图片直到 413 | P1 |
-| E-036 | SSE error 帧的真实形状（真的撞一次限流） | 用超大上下文触发 | P2 |
-| E-037 | `v1.0.35` 版本号是否被校验 | 改成不存在的版本打一次 | P2 |
-| E-038 | `x-raccoon-session-id` 到底影响什么 | 同对话用不同 id 看是否更早限流 | P2 |
-| E-039 | 桌面端凭据过期后客户端怎么续（我们能否搭车） | 等 12-04 观察客户端行为 | P2 |
+| **E-018** | 图片必须 base64 data URL，还是也接受 https URL | **两种都支持**。裸 base64（不带 `data:` 前缀）会被当成 URL 去下载 → 必须带前缀。`image download failed` 是服务端下载失败，不是"不支持 URL" | [E-018](./05-empirical-findings.md) |
+| **E-019** | `413` 的确切阈值（曾猜 10 MB？含 base64 膨胀？） | **约 3.0001 MiB（3,145,650 ± 50 字节）**，3,145,600 通 / 3,145,700 拒。**返回 400 不是 413** —— 按 413 做分支是死代码 | [E-019](./05-empirical-findings.md) |
+| **E-036** | SSE error 帧的真实形状 / 签到接口 | `POST /api/web/desktop/v1/login/points/grant`（无 body），幂等，`granted:false` = 今日已领 | [E-036](./05-empirical-findings.md) |
+| **E-037** | token 刷新（body 字段名 / 版本号是否校验） | 端点存在、字段名是 `token`、格式校验猜不出；**且 refresh 会 rotate，一 rotate 就把官方客户端踢下线 → 本项目不做自动续期** | [E-037](./05-empirical-findings.md) |
+| **E-038** | `x-raccoon-session-id` 到底影响什么 / 设备身份头 | `X-Client-Device-ID` 是唯一设备身份头；带不带对 `balance` 与 `model_catalog` 都 200 且结果一致 | [E-038](./05-empirical-findings.md) |
+| **E-039** | 桌面端凭据过期后客户端怎么续（我们能否搭车） | 真实倍率看 `billing_effective_multiplier`（`billing_multiplier` 是标价）；免费模型的 `end_at` 不是判据 | [E-039](./05-empirical-findings.md) |
+
+**唯一仍然"没验过"的不是实测项，是人工路径**：扫码登录（协议 A / 协议 B）从没被真人用手机扫过一次，号池的「扫码添加」因此也只在协议层验证过。这条记在 `docs/00-index.md` 的对齐状态段。
 
 ---
 

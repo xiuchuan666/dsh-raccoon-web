@@ -1,7 +1,7 @@
 {
   "name": "dsh-raccoon-web",
-  "version": "0.1.0",
-  "description": "把商汤小浣熊（Raccoon）网页网关接进 DSH 作为 LLM provider —— 微信扫码登录，不依赖桌面端凭据。",
+  "version": "0.2.0",
+  "description": "把商汤小浣熊（Raccoon）网页网关接进 DSH 作为 LLM provider —— 默认复用官方桌面客户端登录态，扫码兜底，自带多账号池。",
   "type": "module",
   "license": "MIT",
   "private": true,

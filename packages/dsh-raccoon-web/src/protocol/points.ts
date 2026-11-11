@@ -1,18 +1,35 @@
 /**
- * 积分：余额 + 流水。
+ * 积分：余额 + 流水 + 每日领取。
  *
- * **只读。** 不实现任何"领取"。
+ * **读为主，只有一个写操作：`grantDaily()`。**
  *
- * 为什么不做自动签到：浣熊没有独立的签到接口，每日积分是"当天首次带登录态
- * 访问网页时"由服务端发放的。重放 `setting_info` 请求能触发它，但那等于
- * 未经用户在当时同意的情况下改变账号状态（会产生一条"你已领取"的记录）。
- * 三份参考实现里只有 dsh-llm-adapters 做对了这件事（只读），
- * 见 docs/01-research/03-raccoon-protocol.md §4。
+ * ## 关于"签到"这条判断的更正（2026-11-11）
+ *
+ * 这个文件头原先写着「浣熊没有独立的签到接口，每日积分是当天首次带登录态访问
+ * 网页时由服务端发放的」，并据此决定"只读、不实现任何领取"。**那条判断是错的。**
+ *
+ * 逆向官方桌面端 `app.asar`（latin1 全量扫描，枚举出 57 个 `/api/web/...` 端点）
+ * 后找到了真实的写接口：
+ *
+ * ```
+ * POST /api/web/desktop/v1/login/points/grant      ← 无 body
+ * → 200 { code: 0, data: { granted: true | false, popup: ... } }
+ * ```
+ *
+ * E-036 实测：连续两次调用都返回 `granted:false`（当天已由官方客户端领过），
+ * 说明它**幂等**，且 `granted` 本身就是"今日是否新领到"的判据。
+ *
+ * ## 为什么仍然先查后写
+ *
+ * `granted:false` 的幂等是**上游行为**，不是契约。批量签到 5 个号时，
+ * 对已经领过的号再打一次写请求没有收益，只有风险。所以 `host` 层会先
+ * `fetchBills()` 看今天有没有 `daily_grant` 流水，有就跳过写请求。
+ * 这个判断在本文件里由 `todayGranted()` 提供。
  *
  * @module protocol/points
  */
 
-import { POINTS_BASE, POINTS_TIMEOUT_MS } from "./consts.js";
+import { GRANT_PATH, POINTS_BASE, POINTS_TIMEOUT_MS } from "./consts.js";
 import { RaccoonError, isDeadSessionCode, isRateLimited } from "./errors.js";
 import { webHeaders } from "./headers.js";
 
@@ -167,4 +184,84 @@ export function raccoonDay(input: string | number | Date): string {
 export function todayGranted(bills: readonly RaccoonBill[], now: Date = new Date()): RaccoonBill | undefined {
   const today = raccoonDay(now);
   return bills.find((b) => b.bizType === "daily_grant" && b.at !== undefined && raccoonDay(b.at) === today);
+}
+
+/** `grantDaily()` 的结果。 */
+export interface GrantResult {
+  /**
+   * 上游说这次真的发放了。
+   *
+   * `false` **不是错误** —— 它表示"今天已经领过"。E-036 实测：当天已领时
+   * 连续两次调用都返回 `granted:false` 且 HTTP 200。
+   */
+  granted: boolean;
+  /** 上游原始 `data`。诊断用，也用于把 `popup` 文案透给 UI。 */
+  raw: Record<string, unknown>;
+}
+
+/**
+ * 领取今日积分。
+ *
+ * ```
+ * POST /api/web/desktop/v1/login/points/grant     ← 无 body
+ * → { code: 0, data: { granted: boolean, popup: ... } }
+ * ```
+ *
+ * ## 三个必须记住的点
+ *
+ * 1. **路径前缀是 `desktop/v1`，不是 `points/v1`。** 它挂在桌面端登录域下，
+ *    不在积分域下。按"积分都在 POINTS_BASE 下"去猜会 404。
+ * 2. **不带 body。** 官方客户端就是空 POST（E-036 的 asar 原文）。
+ * 3. **它是写操作。** 调用方应当先用 `fetchBills()` + `todayGranted()` 判断，
+ *    已领过就不要再发 —— 幂等是上游行为，不是契约。
+ */
+export async function grantDaily(token: string, fetchImpl: FetchImpl = fetch): Promise<GrantResult> {
+  let res: Response;
+  let text: string;
+  try {
+    res = await fetchImpl(GRANT_PATH, {
+      method: "POST",
+      headers: webHeaders(token),
+      redirect: "error",
+      signal: AbortSignal.timeout(POINTS_TIMEOUT_MS),
+    });
+    text = await res.text();
+  } catch (err) {
+    if (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")) {
+      throw new RaccoonError("TIMEOUT", "领取小浣熊每日积分超时", { cause: err });
+    }
+    throw new RaccoonError("TRANSPORT", `连不上小浣熊：${err instanceof Error ? err.message : String(err)}`, {
+      cause: err,
+    });
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new RaccoonError("SERVER", `小浣熊领取接口返回了无法解析的内容（HTTP ${res.status}）`, {
+      status: res.status,
+      upstream: text,
+    });
+  }
+
+  const body = (payload ?? {}) as { code?: unknown; message?: unknown; data?: Record<string, unknown> };
+  const code = body.code;
+  if (res.status === 401 || res.status === 403 || isDeadSessionCode(code)) {
+    throw new RaccoonError("AUTH", "小浣熊登录已失效", { status: res.status, upstream: text });
+  }
+  if (isRateLimited(res.status, text)) {
+    throw new RaccoonError("RATE_LIMIT", "小浣熊限流", { status: res.status, upstream: text });
+  }
+  if (!res.ok) {
+    throw new RaccoonError("SERVER", `小浣熊领取接口返回 HTTP ${res.status}`, { status: res.status, upstream: text });
+  }
+  // `code !== 0` 才算失败。**`granted: false` 不是失败**，见上方注释。
+  if (typeof code === "number" && code !== 0) {
+    const message = typeof body.message === "string" ? body.message : `code=${code}`;
+    throw new RaccoonError("SERVER", `小浣熊领取接口返回 ${message}`, { upstream: text });
+  }
+
+  const data = body.data ?? {};
+  return { granted: data["granted"] === true, raw: data };
 }

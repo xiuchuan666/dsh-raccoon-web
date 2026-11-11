@@ -76,7 +76,7 @@ node scripts/verify-install.mjs # 全绿
 #    → docs/03-plan/02-test-plan.md §3 全部
 ```
 
-### `verify-install.mjs` 到底验什么
+### `verify-install.mjs` 到底验什么（2026-11-11：24 项）
 
 ```js
 // 1. package.json 的 dsh.bundle.patch 指向的文件存在
@@ -87,9 +87,18 @@ node scripts/verify-install.mjs # 全绿
 // 6. lib/index.js 存在且能被 node --check 解析（ESM）
 // 7. 从安装目录 import("@deepseek-ai/dsh-llm") 成功（确认宿主能解析）
 // 8. peerDependencies 用逐段并集，且每一段都是合法 semver range
+// 9. src/build.ts 的 VERSION 与 package.json 的 version 一致
+// 10. lib/index.js 里内联的 VERSION 与 package.json 一致（产物是否重新构建过）
+// 11. client.js 的 BUILD 与 src/build.ts 的 BUILD 一致（两处手写，最容易漂）
 ```
 
 第 4 条是**最容易踩的**：client.js 是 classic script，只要有一个 `import` 语句就会整体加载失败，且**报错不会出现在 DSH 日志里**（只在浏览器 console）。
+
+**第 9~11 条是 2026-11-11 加的三条**，都来自真实事故：
+
+- 第 9 条：`src/build.ts` 的 `VERSION` 是**手写**的（不用 ESM 读 `package.json`，因为要 import assertion、tsup 会把它变形）。0.2.0 那轮 `package.json` 升了、`build.ts` 忘了升，宿主 status 端点一直报 `0.1.0` —— 看起来像"新版本根本没装上去"。
+- 第 10 条：源码改对了但忘了 `npm run build`，产物里还是旧常量。查源码不够，必须查产物。
+- 第 11 条：`BUILD` 在宿主（`src/build.ts`）与浏览器半身（`client.js`）各写一份，是排查"改了界面没变化"的唯一判据。两边漂了，这个判据就废了。**注意 client.js 用单引号、build.ts 用双引号**，正则要同时认两种（第一版只认双引号，把这条检查自己写红了）。
 
 第 8 条检查写法：
 

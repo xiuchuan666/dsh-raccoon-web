@@ -4,6 +4,7 @@
 - 日期: 2026-11-06
 - 决策者: 项目所有者
 - 相关: [E-029](../01-research/05-empirical-findings.md)、[E-033](../01-research/05-empirical-findings.md)、[ADR-0002](./0002-self-contained-qr-encoder.md)、[ADR-0008](./0008-desktop-credential-reuse.md)
+- 补正: 第 91 行「IAM token 没有 legacy refresh grant」**已被 [ADR-0011](./0011-no-token-refresh.md) 纠正**（续期接口存在，见 E-037）。该 ADR 的**结论**（`refreshToken` 读到了也不存）不变 —— 存了也不能用，用了会 rotate 踢掉官方客户端。按 AGENTS.md 第 3 条，正文保留原样不改。
 
 ---
 

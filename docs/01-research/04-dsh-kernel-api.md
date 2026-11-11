@@ -1,4 +1,9 @@
-# DSH 内核 API 契约（0.2.1-rc.5）
+# DSH 内核 API 契约（0.2.2-rc.1）
+
+> **版本**：本文档在 2026-11-11 按 **0.2.2-rc.1** 复核过一遍。此前版本写的是 `0.2.1-rc.5`，
+> 两次之间客户端侧有两处行为变化：①`locale.register` 重复注册会抛错（§10.2b）；
+> ②`settings.section` 成为设置对话框菜单的唯一入口（§10.2）。
+> 内核 checkout：`C:\Users\Administrator\AppData\Local\Programs\DeepSeek Harness\resources\app\dsh\`。
 
 最后更新: 2026-11-06（按真宿主实测回填；`registerAdapter` 三处签名已纠正）
 状态: 已定稿
@@ -591,14 +596,67 @@ function isLoopback(host: string | undefined): boolean {
 2. 不能有 JSX（没有构建步骤）
 3. **`var React` / `var h` 必须声明在 IIFE 作用域**，只在 `factory` 里赋值 —— 组件都定义在 IIFE 里，写在 factory 内会让组件里 `h` 未定义
 
-### 10.2 Slot 注册的两种键
+### 10.2 Slot 注册的三种键（0.2.2-rc.1 实测）
 
-| slot | 键 | 说明 |
-| --- | --- | --- |
-| `conversation.input.left` | `id: "raccoon-credits"` | 可以有多个实例 |
-| `plugins.bundle.config` | `key: BUNDLE_NAME` | 一个插件一个 |
+| slot | kind / scope | 键 | 说明 |
+| --- | --- | --- | --- |
+| `conversation.input.left` | list | `id: "raccoon-credits"` | 输入框左侧，可以有多个实例 |
+| `plugins.bundle.config` | keyed | `key: BUNDLE_NAME` | **「插件」面板 → 已安装 → 点开包详情**才渲染 |
+| `settings.section` | list / root | `id: BUNDLE_NAME` | **设置对话框左侧菜单项**，`order` 决定位置 |
 
-两个都要带 `order` / `locale` / `inject: () => ({ t })`。
+三个都要带 `order` / `locale` / `inject`（`inject: () => ({ t })`）。
+
+**`settings.section` 的契约**（`dsh-cordis-client-runner/lib/client.js:5340-5395`）：
+
+- `id` **必填**，是 cell key，驱动 `only` 过滤。
+- `order` 可选 number，升序；内置的是 `account = -10` / `models = 10` / `plugins = 15`；第三方常用 `100`。
+- `label` 可以是 `string` 或 `() => string`（thunk 每次投影重读，跟随 locale 切换）。
+- 组件只拿到 `{ close }`（`SettingsSectionOwnerProps`），`inject` **不参与 props 合成** —— 组件要数据得自己 `ctx.slots.inject` 或在闭包里捕获。
+
+```js
+ctx.slots.inject("settings.section", function () {
+  return ctx.slots.register({
+    name: "settings.section",
+    id: BUNDLE_NAME,
+    order: 95,
+    label: function () { return t("title"); },
+    locale: NAMESPACE,
+  }, Page);
+});
+```
+
+第三方参照（`dsh-better-sidebar/lib/client.js:33050-33059`）：
+
+```js
+ctx.slots.inject("settings.section", () => ctx.slots.register({
+  name: "settings.section", id: "better-sidebar", order: 100,
+  label: () => t("settingsNav"), inject: () => ({ store: sidebarStore, service }),
+}, SideCardSection));
+```
+
+### 10.2b `locale.register` 会因重复注册抛错（0.2.2-rc.1 行为变化）
+
+同一 namespace 的同一 locale 第二次注册时**抛错**：
+
+```
+locale namespace "dsh-raccoon-web" already has locale "zh"
+```
+
+触发条件是同一个包被加载两次（用户手动改过 `cordis.patch.yml` 或 `dsh.profile.bundles` 里出现两条）。
+
+**后果很严重**：`apply(ctx)` 第一句就是 `ctx.locale.register(...)`，一抛错后面所有 `slots.inject` 都不执行 → 积分药丸、设置菜单项、插件配置页**一个都不出现**，看起来像"插件完全没生效"。
+
+**所以 `apply()` 里每一步都必须自己 try/catch**，任何一步失败只记 `console.error` 并继续：
+
+```js
+function guard(label, step) {
+  try { step(); } catch (error) {
+    console.error('[dsh-raccoon-web] slot "' + label + '" failed to register:', error);
+  }
+}
+```
+
+离线复现工具：`node scripts/smoke-client-apply.mjs --twice`（用 `node:vm` 加载 `client.js`，注入照抄 0.2.2 语义的替身 ctx，`locale.register` 重复即抛）。
 
 ### 10.3 宿主怎么下发 client.js
 

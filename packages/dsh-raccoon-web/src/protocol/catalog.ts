@@ -55,6 +55,14 @@ export interface CatalogGroup {
 export interface CatalogOptions {
   /** 是否保留下 `visible:false` 的模型。默认 false。 */
   includeHidden?: boolean;
+  /**
+   * 号池用：这个账号的 `x-client-device-id`（ADR-0010 §7）。
+   *
+   * 为什么目录也要带：`pool-test` 用一个号的凭据打目录端点来验证"这个号还活着"，
+   * 如果测试请求不带它自己的设备身份，测的就是"我们这台机器的身份 + 这个号"，
+   * 与真实对话路径（带设备身份）不是同一件事 —— 那种测试通过不代表真能聊。
+   */
+  deviceId?: string;
 }
 
 type FetchImpl = typeof fetch;
@@ -279,7 +287,7 @@ export async function fetchCatalog(
   try {
     res = await fetchImpl(`${LLM_BASE}/model_catalog`, {
       method: "GET",
-      headers: webHeaders(token),
+      headers: webHeaders(token, "zh", options.deviceId),
       redirect: "error",
       signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS),
     });

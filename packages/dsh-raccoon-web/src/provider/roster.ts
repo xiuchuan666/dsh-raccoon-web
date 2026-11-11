@@ -77,6 +77,19 @@ export interface RosterOptions {
    * 的占位名册（fallback）路径下会发生，那条路径本来也发不出请求。
    */
   sessionIdFor?: (modelId: string) => string;
+  /**
+   * 号池路径（ADR-0010）下这个账号的设备身份。
+   *
+   * 写进 `headers["x-client-device-id"]`，随 descriptor 一起进 pi-ai 的
+   * `defaultHeaders`（`createClient()` 会把 `model.headers` 展开进去，
+   * `openai-completions.js:539`）。
+   *
+   * **为什么设备身份是"名册级"而不是"请求级"**：pi-ai 的
+   * `profileOptions()` 不透传 `options.headers`，每请求改头走不通。
+   * 所以换号 = 换名册 = 换 adapter 实例（见 `publish.ts` 的
+   * `rosterSignature` 里为什么要带 `|dev:`）。
+   */
+  deviceId?: string;
 }
 
 /**
@@ -127,7 +140,7 @@ export function toDescriptor(model: RaccoonModel, options: RosterOptions = {}): 
     cost: NO_COST,
     contextWindow,
     maxTokens,
-    headers: sessionId === undefined ? {} : chatModelHeaders(sessionId),
+    headers: sessionId === undefined ? {} : chatModelHeaders(sessionId, "zh", options.deviceId),
     compat: {
       // ── 必须显式覆盖的三项，理由见文件头 ──
       maxTokensField: "max_tokens",

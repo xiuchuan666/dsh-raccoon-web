@@ -107,4 +107,6 @@ log(
     ? "已还原成裸包名：下次启动 DSH 才会加载新代码"
     : `宿主应在几秒内重新 import（入口 ${relative(REPO, ENTRY)}）`,
 );
-log("验证：curl -s http://127.0.0.1:57292/plugins/dsh-raccoon-web/status | grep -o '\"build\":\"[^\"]*\"'");
+// 端口每次启动都会变（57292 / 62732 / 52091 都是历史值），所以这里不写死。
+log('验证：curl -s "http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/status"');
+log("      <PORT> 用 DSH 这次启动打印的那个；也可以 node scripts/login-qr.mjs --wait-only --port <PORT> 直接看登录态");

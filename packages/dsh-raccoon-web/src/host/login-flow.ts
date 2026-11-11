@@ -44,6 +44,18 @@ import { saveToken, type StoredToken } from "./store.js";
 /** 登录阶段。`ready` 表示已有可用 token。 */
 export type LoginPhase = "none" | "pending" | "logging" | "ready" | "expired" | "error";
 
+/**
+ * 这一轮扫码登录的目的是什么（ADR-0010 §4）。
+ *
+ * - `primary`：换掉"当前账号"，会写 `token.json`（老行为）。
+ * - `pool`：给号池加一个号，**不碰 `token.json`、不改当前 token**。
+ *
+ * 为什么要显式区分：同一个 `LoginFlow` 同时服务两个入口，如果靠"调用前先设一个
+ * 布尔字段"来区分，两次并发登录（用户先点主登录再点加号）就会互相污染。
+ * 改成随 `start()` 传参、随 `complete()` 回传，语义跟着那一轮会话走。
+ */
+export type LoginMode = "primary" | "pool";
+
 /** 对外暴露的快照。**不含 token。** */
 export interface LoginSnapshot {
   phase: LoginPhase;
@@ -53,6 +65,19 @@ export interface LoginSnapshot {
   deadline?: number;
   /** 用户可读提示。`phase === "error"` 时是错误说明。 */
   message?: string;
+  /**
+   * 这一轮（或当前这个 token）是给谁用的：换当前账号，还是往池里加一个号。
+   *
+   * **界面必须看它**：设置卡里「登录」区和「账号池」区各有一个扫码按钮，
+   * 但底下只有同一个 `LoginFlow`。如果前端只按 `phase === "pending"` 判断
+   * "要不要显示这个二维码"，就会出现这样的场景 —— 用户先点「扫码添加」
+   * 拿到池的码，又去上面点「扫码登录」，后者 `start()` 会把前一轮取消并起
+   * 一张新码；此时号池区仍然显示着二维码（因为相位还是 pending），
+   * 但那张码已经是主登录的了，用户扫完 token 写进 `token.json` 而不是池。
+   *
+   * 所以两个区都必须用 `mode` 认领"这张码是不是我的"。
+   */
+  mode?: LoginMode;
 }
 
 /** 构造参数。全部注入，方便单测。 */
@@ -63,7 +88,7 @@ export interface LoginFlowOptions {
   /** 已有 token 时的初始状态判定。 */
   initialToken?: StoredToken;
   /** 登录成功后回调（用于注册 provider）。 */
-  onReady: (token: StoredToken) => Promise<void> | void;
+  onReady: (token: StoredToken, mode: LoginMode) => Promise<void> | void;
   /** 时钟，测试用。 */
   now?: () => number;
   /** fetch，测试用。 */
@@ -100,6 +125,13 @@ export class LoginFlow {
   private code: string | undefined;
   /** 本轮用的是哪套协议。`start()` 定下来，`tick()` 按它分派。 */
   private protocol: QrProtocol = "web";
+  /**
+   * 本轮登录的目的。`start()` 定下来，`complete()` 原样回传给 `onReady`。
+   *
+   * 与 `protocol` 一样属于"这一轮会话的属性"，不是实例级配置 ——
+   * 所以每轮重置，且必须由 `start()` 的参数决定。
+   */
+  private mode: LoginMode = "primary";
   private disposed = false;
 
   constructor(options: LoginFlowOptions) {
@@ -113,7 +145,7 @@ export class LoginFlow {
 
   /** 当前快照。纯读，不改状态。 */
   snapshot(): LoginSnapshot {
-    const base: LoginSnapshot = { phase: this.phase };
+    const base: LoginSnapshot = { phase: this.phase, mode: this.mode };
     if (this.qrSvg !== undefined && (this.phase === "pending" || this.phase === "logging")) {
       base.qrSvg = this.qrSvg;
     }
@@ -131,13 +163,15 @@ export class LoginFlow {
    * 用户看到的是设置卡里的一句提示 + 一个"重新获取"按钮，而不是一个
    * 停在 pending 的空二维码框。
    */
-  async start(): Promise<LoginSnapshot> {
+  async start(mode: LoginMode = "primary"): Promise<LoginSnapshot> {
     if (this.disposed) return this.snapshot();
     this.cancel();
     const generation = this.generation;
     // 每轮重新读一次协议：用户可能在设置里换了，或者刚从 iam 切到 web。
     const protocol = this.options.qrProtocol?.() ?? "web";
     this.protocol = protocol;
+    // 目的同样每轮定：`pool` 时这一轮**不许**写 token.json（ADR-0010 §4）。
+    this.mode = mode;
 
     if (protocol === "web") {
       // Web auth 码**完全本地生成**，没有网络请求，所以不存在"取码失败"。
@@ -196,6 +230,9 @@ export class LoginFlow {
     // 登录，不登出。登出走 logout()。
     if (this.phase !== "ready") this.phase = "none";
     this.message = undefined;
+    // 取消之后这一轮就没有"目的"了。`start()` 会紧接着按参数重新设一次，
+    // 所以在这里重置不会丢信息，反而避免快照里残留上一轮的 mode。
+    this.mode = "primary";
   }
 
   /** 卸载时调。之后所有在途回调都无效。 */
@@ -224,6 +261,8 @@ export class LoginFlow {
   markDead(message: string): void {
     if (this.phase === "pending" || this.phase === "logging") this.cancel();
     this.phase = "expired";
+    // 判死说的是"当前账号"的 token，与上一轮池登录无关。
+    this.mode = "primary";
     this.message = message;
     this.qrSvg = undefined;
     this.deadline = undefined;
@@ -241,6 +280,8 @@ export class LoginFlow {
   markReady(message?: string): void {
     this.cancel();
     this.phase = "ready";
+    // `ready` 只描述"当前账号"，不描述某一轮扫码的目的。
+    this.mode = "primary";
     this.message = message;
     this.options.logger.info("login/ready-desktop");
   }
@@ -373,6 +414,27 @@ export class LoginFlow {
       principal: principalOf(token),
     };
 
+    // **号池模式不写 token.json、不改主登录相位**（ADR-0010 §4）。
+    //
+    // 两个理由：
+    // 1. `token.json` 是"当前账号"，加一个池成员不是换当前账号。写进去会让
+    //    用户下次冷启动莫名其妙登成了刚加的那个号。
+    // 2. 主登录相位（`ready`）决定设置卡显示"已登录"还是"未登录"，
+    //    加池成员时当前账号可能本来就是登录着的，被这轮覆盖会闪一下。
+    if (this.mode === "pool") {
+      this.code = undefined;
+      this.phase = this.phase === "ready" ? "ready" : "none";
+      this.qrSvg = undefined;
+      this.deadline = undefined;
+      this.message = undefined;
+      // 这一轮结束了，把 mode 收回默认值 —— 否则 status 会一直报 `mode: "pool"`，
+      // 界面那边的 `useEffect([login.mode])` 也没法判断"这一轮结束了"。
+      this.mode = "primary";
+      this.options.logger.info("login/pool-ready", { token: tokenTag(token), kind, principal: stored.principal });
+      await this.options.onReady(stored, "pool");
+      return;
+    }
+
     await saveToken(stored);
     this.phase = "ready";
     this.qrSvg = undefined;
@@ -381,6 +443,6 @@ export class LoginFlow {
     this.code = undefined;
     this.options.logger.info("login/ready", { token: tokenTag(token), kind, principal: stored.principal });
 
-    await this.options.onReady(stored);
+    await this.options.onReady(stored, "primary");
   }
 }
