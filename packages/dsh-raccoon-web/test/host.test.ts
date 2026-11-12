@@ -357,6 +357,106 @@ describe("LoginFlow 的 mode 生命周期", () => {
   });
 });
 
+describe("LoginFlow 的换码与 deadline 校正", () => {
+  function makeFlow(): LoginFlow {
+    return new LoginFlow({
+      logger: silentLogger(),
+      renderQr: () => "<svg/>",
+      onReady: () => undefined,
+      now: () => 1_700_000_000_000,
+      qrProtocol: () => "web",
+    });
+  }
+
+  /**
+   * 白盒调私有方法：这两个方法只在 `tick()` 里被调，而 `tick()` 的定时器
+   * 最小间隔是 500ms、Web auth 的轮询间隔固定 2s —— 走真时钟要 8 秒。
+   * 这里只验逻辑本身（计数上限、deadline 换算），不验调度。
+   */
+  type FlowInternals = {
+    generation: number;
+    reissue: (generation: number) => Promise<void>;
+    applyServerDeadline: (expiresIn: number | undefined) => void;
+    reissues: number;
+    deadline: number | undefined;
+  };
+
+  it("ST-28: canceled 换码有上限，超了就收尾而不是无限换", async () => {
+    const flow = makeFlow();
+    const inner = flow as unknown as FlowInternals;
+    void flow.start("pool");
+    assert.equal(inner.reissues, 0, "新开一轮计数归零");
+
+    // 三次换码都还在等，而且**仍是池模式** —— 池的码换过之后不能变回主登录。
+    for (let i = 1; i <= 3; i += 1) {
+      await inner.reissue(inner.generation);
+      assert.equal(flow.snapshot().phase, "pending");
+      assert.equal(flow.snapshot().mode, "pool");
+      assert.equal(inner.reissues, i);
+    }
+
+    // 第四次超上限：收尾，且给一句人话，而不是界面一直转圈。
+    await inner.reissue(inner.generation);
+    assert.equal(flow.snapshot().phase, "none");
+    assert.match(flow.snapshot().message ?? "", /重新获取/);
+    assert.equal(flow.snapshot().qrSvg, undefined);
+
+    // 用户手动重开一轮，计数要回到 0，否则一次失败会把整条路线永久锁死。
+    void flow.start("pool");
+    assert.equal(inner.reissues, 0);
+    assert.equal(flow.snapshot().phase, "pending");
+    flow.dispose();
+  });
+
+  it("ST-29: 服务端给的剩余秒数覆盖本地粗估，且夹在整体超时以内", () => {
+    const flow = makeFlow();
+    const inner = flow as unknown as FlowInternals;
+    void flow.start();
+
+    // 起手那个 300 秒是抄官方客户端的粗估，没有服务端依据。
+    assert.equal(inner.deadline, 1_700_000_000_000 + 300_000);
+
+    // `logging` 阶段服务端才第一次给 expired_at（官方网页端就在那里记）。
+    inner.applyServerDeadline(42);
+    assert.equal(inner.deadline, 1_700_000_000_000 + 42_000);
+
+    // 上游给了个离谱的大数时，不能把 deadline 推到十年后。
+    inner.applyServerDeadline(999_999);
+    assert.equal(inner.deadline, 1_700_000_000_000 + 330_000);
+
+    // 没给就别动 —— 不能因为一次缺字段就把 deadline 清掉。
+    inner.applyServerDeadline(undefined);
+    assert.equal(inner.deadline, 1_700_000_000_000 + 330_000);
+    flow.dispose();
+  });
+  it("ST-30: 快照带出 lastPoll，且 cancel 之后不再残留", async () => {
+    // "扫了没反应"是最难排的一类：界面上只有一个转圈，看不出服务端到底
+    // 认没认这张码。把服务端上次回的原始状态放进快照，一句 curl 就能定位。
+    const flow = makeFlow();
+    const inner = flow as unknown as {
+      generation: number;
+      lastPoll: string | undefined;
+      lastPollAt: number | undefined;
+    };
+    void flow.start();
+    assert.equal(flow.snapshot().lastPoll, undefined, "还没轮询过时不该有");
+
+    inner.lastPoll = "pending";
+    inner.lastPollAt = 1_700_000_000_000;
+    const snap = flow.snapshot();
+    assert.equal(snap.lastPoll, "pending");
+    assert.equal(snap.lastPollAt, 1_700_000_000_000);
+
+    // 未知状态被当成 pending 之后，原文仍要看得出来。
+    inner.lastPoll = "pending:blocked";
+    assert.equal(flow.snapshot().lastPoll, "pending:blocked");
+
+    flow.cancel();
+    assert.equal(flow.snapshot().lastPoll, undefined, "换一轮时不能带着上一轮的结果");
+    flow.dispose();
+  });
+});
+
 describe("日志脱敏", () => {
   it("ST-20: tokenTag 是 8 位 hex，且不含 token 片段", () => {
     const tag = tokenTag("xhx_super_secret_value");
@@ -410,6 +510,7 @@ describe("buildDiagnostics", () => {
       settings: { ...DEFAULT_SETTINGS },
       desktopAuth: { found: false, reason: "未找到桌面客户端登录态，已回退到扫码" },
       pool: { enabled: false, ready: false, total: 0, enabledCount: 0, accounts: [] },
+      browser: { active: false },
       diagnostics: "",
     };
     const text = buildDiagnostics({ build: snapshot.build, version: snapshot.version, snapshot });
@@ -446,6 +547,7 @@ describe("buildDiagnostics", () => {
         activeId: "0123456789abcdef",
         accounts: [],
       },
+      browser: { active: false },
       diagnostics: "",
     };
     const text = buildDiagnostics({ build: snapshot.build, version: snapshot.version, snapshot });
@@ -465,6 +567,7 @@ describe("buildDiagnostics", () => {
       settings: { ...DEFAULT_SETTINGS, poolEnabled: true },
       desktopAuth: { found: false },
       pool: { enabled: true, ready: true, total: 2, enabledCount: 0, accounts: [], note: "有账号但一个都没勾选启用，所以还是用当前账号。" },
+      browser: { active: false },
       diagnostics: "",
     };
     const text = buildDiagnostics({ build: snapshot.build, version: snapshot.version, snapshot });

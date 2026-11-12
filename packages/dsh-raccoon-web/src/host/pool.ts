@@ -77,11 +77,28 @@ export interface PoolAccount {
    * （E-038）。每次请求随机化正好破坏这个契约，比共用还糟。
    */
   deviceId: string;
-  /** 从哪来的。 */
-  source: "qr" | "desktop";
+  /**
+   * 从哪来的。
+   *
+   * - `qr`：插件里扫码换来的（IAM 小程序码或 Web auth 码）。
+   * - `desktop`：从官方桌面客户端的 `auth.json` 只读导入。
+   * - `browser`：浏览器 loopback（`/authorize` → 本机回调 → 换 token）。
+   *
+   * 三个值都要能被 `accounts.json` 读回来 —— 少一个就会在重启后退化成 `qr`，
+   * 排障时看到"我明明是浏览器登录的，怎么标成扫码"。
+   */
+  source: PoolSource;
   /** 最近一次测量。观测，不是草稿。 */
   measure?: PoolMeasure;
 }
+
+/**
+ * 池成员的凭据来源。
+ *
+ * 与 `StoredToken["source"]` 同一套词表（`store.ts`），但那里是可选字段
+ * （旧文件没有这个键），这里是必填 —— 池里每一条都必须说得清从哪来。
+ */
+export type PoolSource = "qr" | "desktop" | "browser";
 
 /** 余额读数缓存。**不落盘**，进程内存里 10 分钟有效。 */
 export interface PoolQuota {
@@ -159,7 +176,7 @@ function normalizeAccount(input: unknown): PoolAccount | undefined {
     enabled: rec["enabled"] === true,
     // 旧文件没有 deviceId → 补一个。补出来的就是它此后的固定身份。
     deviceId: typeof deviceId === "string" && deviceId.length > 0 ? deviceId : newDeviceId(),
-    source: source === "desktop" ? "desktop" : "qr",
+    source: source === "desktop" ? "desktop" : source === "browser" ? "browser" : "qr",
     ...(normalizeMeasure(rec["measure"]) === undefined ? {} : { measure: normalizeMeasure(rec["measure"]) }),
   };
 }
@@ -201,7 +218,7 @@ export function upsertAccount(
     principal: string;
     expiresAt?: number;
     label?: string;
-    source: "qr" | "desktop";
+    source: PoolSource;
     now: number;
   },
 ): PoolAccount[] {
@@ -218,11 +235,33 @@ export function upsertAccount(
     // 新号默认不入池；老号保留用户的勾选。
     enabled: existing?.enabled ?? false,
     deviceId: existing?.deviceId ?? newDeviceId(),
-    source: existing?.source ?? input.source,
+    // `source` 跟着**最后一次**来源走：同一个号先扫码进来、后来又用桌面端
+    // 凭据导入，那它现在持有的就是桌面端 token，标成 `qr` 会误导排障。
+    source: input.source,
     ...(existing?.measure === undefined ? {} : { measure: existing.measure }),
   };
   const others = accounts.filter((a) => a.id !== id);
   return [...others, next];
+}
+
+/**
+ * 把"内存里的表"和"磁盘上的表"合并成一张，**以 id 为键做并集**。
+ *
+ * 为什么需要：`writePool()` 是**整表原子写**。如果调用方手里的 `this.accounts`
+ * 比磁盘旧（插件启动后别处写过、或者上次写入失败只更新了内存），
+ * 直接 `writePool(this.accounts)` 就会把磁盘上那些账号整片抹掉。
+ * 用户看到的现象是"导入第二个账号，第一个账号消失了" —— 账号根本没被删，
+ * 是被一张过期的整表覆盖了。
+ *
+ * 合并规则：两边都有的 id 用**内存**那份（内存才是这个实例当前的决定：
+ * 勾选状态、冷却记录），磁盘独有的追加进来。这样既不丢号，也不会把
+ * 用户刚在界面上做的勾选回滚成磁盘上的旧值。
+ */
+export function mergePools(memory: readonly PoolAccount[], disk: readonly PoolAccount[]): PoolAccount[] {
+  const byId = new Map<string, PoolAccount>();
+  for (const account of disk) byId.set(account.id, account);
+  for (const account of memory) byId.set(account.id, account);
+  return [...byId.values()];
 }
 
 /** 该账号是否在冷却中。`dead` 的 `until` 是 `MAX_SAFE_INTEGER`，永远算冷却。 */
@@ -353,7 +392,7 @@ export function classifyMeasure(input: MeasureInput): PoolMeasure | undefined {
 
   // 已知 kind 优先：它来自我们自己的错误分类，比裸状态码准。
   if (kind === "AUTH") {
-    return { state: "dead", at: now, until: Number.MAX_SAFE_INTEGER, note: "登录已失效，需要重新扫码" };
+    return { state: "dead", at: now, until: Number.MAX_SAFE_INTEGER, note: "登录已失效，需要重新登录这个账号" };
   }
   if (kind === "RATE_LIMIT") {
     return {
@@ -380,7 +419,7 @@ export function classifyMeasure(input: MeasureInput): PoolMeasure | undefined {
     return { state: "ok", at: now, note: "正常" };
   }
   if (status === 401 || status === 403) {
-    return { state: "dead", at: now, until: Number.MAX_SAFE_INTEGER, note: "登录已失效，需要重新扫码" };
+    return { state: "dead", at: now, until: Number.MAX_SAFE_INTEGER, note: "登录已失效，需要重新登录这个账号" };
   }
   if (status === 429 || body.includes("200429")) {
     return {

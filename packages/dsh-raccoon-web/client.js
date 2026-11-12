@@ -38,7 +38,7 @@
      * 构建标记。必须与宿主 src/build.ts 的 BUILD 一致 ——
      * 不一致就说明浏览器加载的是缓存的旧脚本。
      */
-    var BUILD = '2026-11-11T23:05';
+    var BUILD = '2026-11-12T02:05';
 
     /** provider id。宿主用同一个值注册，这里只用来判断"当前选的是不是我"。 */
     var PROVIDER_ID = 'raccoon-web';
@@ -73,6 +73,7 @@
         loginOut: '退出登录',
         loginScanHint: '用微信扫描二维码，在手机上确认后这里会自动变成已登录。',
         loginPoolBusy: '正在为账号池添加账号 —— 二维码在下面的「账号池」区域，扫完不会改变当前账号。',
+        loginLastPoll: '最近一次轮询：{value}',
         loginExpiresIn: '{seconds} 秒后失效',
         loginAccount: '账号',
         loginTokenKind: '令牌类型',
@@ -176,6 +177,12 @@
         poolCheckinFailed: '签到失败',
         poolAddHint: '新加进来的账号默认不启用，勾上才会被拿去发请求。',
         poolImportOk: '已导入客户端账号。',
+        poolAddBrowser: '浏览器登录',
+        poolAddBrowserBusy: '正在打开…',
+        poolBrowserHint: '在浏览器里用手机号或微信登录，完成后浏览器会跳回本机，这个页面会自动出现新账号。官方客户端换账号用的就是这条路。',
+        poolBrowserWaiting: '正在等待浏览器完成登录（最多 5 分钟）。',
+        poolBrowserOpen: '打开授权页',
+        poolBrowserCancel: '取消等待',
     };
 
     var en = {
@@ -203,6 +210,7 @@
         loginOut: 'Sign out',
         loginScanHint: 'Scan with WeChat and confirm on your phone. This page updates by itself.',
         loginPoolBusy: 'Adding an account to the pool — the QR code is in the Account pool section below. Scanning it will not change the current account.',
+        loginLastPoll: 'Last poll: {value}',
         loginExpiresIn: 'expires in {seconds}s',
         loginAccount: 'Account',
         loginTokenKind: 'Token kind',
@@ -306,6 +314,12 @@
         poolCheckinFailed: 'failed',
         poolAddHint: 'A newly added account starts disabled; tick it before it can serve requests.',
         poolImportOk: 'Desktop account imported.',
+        poolAddBrowser: 'Sign in with browser',
+        poolAddBrowserBusy: 'Opening…',
+        poolBrowserHint: 'Sign in with your phone number or WeChat in the browser. When you are done the browser jumps back to this machine and the new account appears here. This is the same route the desktop app uses to switch accounts.',
+        poolBrowserWaiting: 'Waiting for the browser to finish signing in (up to 5 minutes).',
+        poolBrowserOpen: 'Open the authorize page',
+        poolBrowserCancel: 'Stop waiting',
     };
 
     // ---------------------------------------------------------------- 样式
@@ -853,6 +867,12 @@
                 h('div', { style: rowStyle },
                     h('span', { style: { fontWeight: 600 } }, t(phase === 'logging' ? 'loginLogging' : 'loginPending')),
                     h('span', { style: dimStyle }, t('loginExpiresIn', { seconds: seconds }))),
+                // 「扫了没反应」时，服务端到底回了什么只有这一行说得清。
+                // 早先没有它，只能靠翻日志或重放请求去猜（2026-11-12 为此白跑一轮取证）。
+                login.lastPoll === undefined
+                    ? null
+                    : h('div', { style: Object.assign({}, dimStyle, { fontSize: '11px', fontFamily: 'ui-monospace, monospace' }) },
+                        t('loginLastPoll', { value: login.lastPoll })),
                 pendingIsPool
                     ? h('div', { style: Object.assign({}, dimStyle, { fontSize: '12px' }) }, t('loginPoolBusy'))
                     : login.qrSvg === undefined
@@ -1146,6 +1166,19 @@
         var qrState = React.useState(undefined);
         var pendingQr = qrState[0];
         var setPendingQr = qrState[1];
+        // 「一键签到」的逐号结果。宿主已经按号返回 `results` 了，不显示出来
+        // 用户就只能看到一个按钮转两秒然后什么都没变 —— 签到是每天一次的
+        // 动作，用户最想知道的是"哪个号领到了、哪个号失败了"。
+        var checkinState = React.useState({});
+        var checkins = checkinState[0];
+        var setCheckins = checkinState[1];
+
+        // 浏览器登录状态。**从 status 读，不自己记** —— 一轮可能在用户切走
+        // 设置卡、切回来之后还在等（`/authorize` 是用户在浏览器里操作的，
+        // 可能花一两分钟），自己记就丢了。
+        var browser = status.browser || {};
+        var browserActive = browser.active === true;
+        var browserUrl = browser.url === undefined ? '' : String(browser.url);
 
         // 二维码要跟着宿主的状态走，不能停在点按钮那一刻的快照 ——
         // 用户盯着看的是"还剩多少秒"和"扫了没有"，而这两件事只有宿主知道。
@@ -1168,6 +1201,8 @@
 
         function run(action, body, note) {
             setMessage(undefined);
+            // 新一轮签到开始就清掉上一轮的结果，否则失败的号会一直挂着红字。
+            if (action === 'pool-checkin') setCheckins({});
             setBusy(action + (body !== undefined && body.id !== undefined ? ':' + body.id : ''));
             void act(action, body).then(function (result) {
                 setBusy('');
@@ -1179,6 +1214,14 @@
                 }
                 if (action === 'pool-add-start') {
                     setPendingQr(result.login === undefined ? undefined : result.login);
+                }
+                if (action === 'pool-checkin' && Array.isArray(result.results)) {
+                    var next = {};
+                    for (var i = 0; i < result.results.length; i += 1) {
+                        var item = result.results[i];
+                        if (item !== undefined && typeof item.id === 'string') next[item.id] = item;
+                    }
+                    setCheckins(next);
                 }
                 if (note !== undefined) setMessage(note);
             });
@@ -1238,6 +1281,22 @@
             if (measure !== undefined && measure.note !== undefined) {
                 lines.push(h('div', { style: Object.assign({}, dimStyle, { fontSize: '11px' }) }, measure.note));
             }
+            var checkin = checkins[account.id];
+            if (checkin !== undefined) {
+                var failed = checkin.result === 'error';
+                var label = checkin.result === 'granted'
+                    ? t('poolCheckinGranted')
+                    : checkin.result === 'already'
+                        ? t('poolCheckinAlready')
+                        : t('poolCheckinFailed');
+                lines.push(h('div', {
+                    style: {
+                        fontSize: '11px',
+                        color: failed ? 'var(--dsh-danger, #d64545)' : 'var(--dsh-success, #2f9e44)',
+                    },
+                    'data-raccoon-checkin': account.id,
+                }, failed && checkin.message !== undefined ? label + ' · ' + String(checkin.message).split('\n')[0] : label));
+            }
             lines.push(h('div', { style: { display: 'flex', gap: '8px', marginTop: '2px' } },
                 h('button', {
                     type: 'button',
@@ -1292,6 +1351,12 @@
                 h('button', {
                     type: 'button',
                     style: buttonStyle,
+                    disabled: busy !== '' || browserActive,
+                    onClick: function () { run('pool-add-browser'); },
+                }, busy === 'pool-add-browser' ? t('poolAddBrowserBusy') : t('poolAddBrowser')),
+                h('button', {
+                    type: 'button',
+                    style: buttonStyle,
                     disabled: busy !== '',
                     onClick: function () { run('pool-add-start'); },
                 }, t('poolAddQr')),
@@ -1308,13 +1373,49 @@
                     onClick: function () { run('pool-checkin'); },
                 }, busy === 'pool-checkin' ? t('poolCheckinBusy') : t('poolCheckin'))),
             h('div', { style: Object.assign({}, dimStyle, { fontSize: '11px' }) }, t('poolAddHint')),
+            browserActive
+                ? h('div', {
+                    style: {
+                        border: '1px solid var(--dsh-panel-border, rgba(128,128,128,0.2))',
+                        borderRadius: '8px',
+                        padding: '10px 12px',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '7px',
+                    },
+                    'data-raccoon-browser': true,
+                },
+                    h('div', { style: { fontSize: '12px' } }, t('poolBrowserWaiting')),
+                    h('div', { style: Object.assign({}, dimStyle, { fontSize: '11.5px' }) }, t('poolBrowserHint')),
+                    h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } },
+                        h('a', {
+                            style: Object.assign({}, buttonPrimaryStyle, { textDecoration: 'none', display: 'inline-block' }),
+                            href: browserUrl,
+                            target: '_blank',
+                            rel: 'noreferrer noopener',
+                        }, t('poolBrowserOpen')),
+                        h('button', {
+                            type: 'button',
+                            style: buttonStyle,
+                            disabled: busy !== '',
+                            onClick: function () { run('pool-add-browser-cancel'); },
+                        }, t('poolBrowserCancel'))))
+                : null,
+            browser.active !== true && browser.message !== undefined
+                ? h('div', { style: Object.assign({}, dimStyle, { fontSize: '11.5px' }) }, String(browser.message))
+                : null,
             scanning && login.qrSvg !== undefined
                 ? h('div', { style: qrBoxStyle },
                     h('div', {
                         style: { width: '168px', height: '168px', lineHeight: 0 },
                         dangerouslySetInnerHTML: { __html: login.qrSvg },
                     }),
-                    h('div', { style: Object.assign({}, dimStyle, { fontSize: '11.5px', textAlign: 'center' }) }, t('loginScanHint')))
+                    h('div', { style: Object.assign({}, dimStyle, { fontSize: '11.5px', textAlign: 'center' }) }, t('loginScanHint')),
+                    // 加号失败时最想知道的是服务端回了什么，与上面「登录」区同一行诊断。
+                    login.lastPoll === undefined
+                        ? null
+                        : h('div', { style: Object.assign({}, dimStyle, { fontSize: '11px', fontFamily: 'ui-monospace, monospace' }) },
+                            t('loginLastPoll', { value: login.lastPoll })))
                 : null,
             message === undefined
                 ? null

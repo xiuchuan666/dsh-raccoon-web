@@ -49,7 +49,7 @@
 | [04-ui-surfaces.md](02-design/04-ui-surfaces.md) | 客户端半身：三个 slot（含 `settings.section` 设置菜单入口）、设置卡、积分药丸、二维码页、五开关、账号池（含两个扫码入口靠 `login.mode` 认领）、14 行诊断 | ✅ |
 | [05-error-model.md](02-design/05-error-model.md) | 错误分类、用户文案、重试策略 | ✅ |
 | [06-coding-conventions.md](02-design/06-coding-conventions.md) | 代码风格、命名、注释、日志 | ✅ |
-| [07-account-pool.md](02-design/07-account-pool.md) | 账号池：数据模型、选号排序、测量分类、六个 action、独立设备身份 | ✅ |
+| [07-account-pool.md](02-design/07-account-pool.md) | 账号池：数据模型、选号排序、测量分类、八个 action、独立设备身份 | ✅ |
 
 ### ADR（架构决策记录）
 
@@ -63,9 +63,10 @@
 | [0006](02-design/adr/0006-vision-detection-by-probe.md) | 识图能力按实测，不信目录标签 | Accepted |
 | [0007](02-design/adr/0007-wrap-openai-completions-api.md) | 思考通道：包装 `openAICompletionsApi` + `onPayload` 注入 | Accepted（取代 0003） |
 | [0008](02-design/adr/0008-desktop-credential-reuse.md) | 只读官方桌面客户端凭据，作为首选登录方式 | Accepted（取代 0001 的凭据部分；第 77 行表述由 0011 补正） |
-| [0009](02-design/adr/0009-web-auth-qr-protocol.md) | 扫码默认走官方桌面端的 Web auth 协议，IAM 码留作备选 | Accepted（第 91 行表述由 0011 补正） |
+| [0009](02-design/adr/0009-web-auth-qr-protocol.md) | 扫码默认走官方桌面端的 Web auth 协议，IAM 码留作备选 | Accepted（第 91 行表述由 0011 补正；Web auth 码页面 2026-11-12 起 404，见 0012 / E-040） |
 | [0010](02-design/adr/0010-account-pool.md) | 账号池：多账号并列第二身份来源，独立设备标识，额度用尽自动换号 | Accepted |
 | [0011](02-design/adr/0011-no-token-refresh.md) | 不实现 token 自动续期：续期接口存在，但 rotate 会踢掉官方客户端 | Accepted（补正 0008/0009 的一条事实表述） |
+| [0012](02-design/adr/0012-browser-loopback-login.md) | 账号池加号走浏览器 loopback（`/authorize` + 本机回调 + 授权码换 token），扫码降为备用 | Accepted（`/login/mp` 已 404，见 E-040） |
 
 ## 03 计划（plan）
 
@@ -73,7 +74,7 @@
 | --- | --- | --- |
 | [00-roadmap.md](03-plan/00-roadmap.md) | 阶段划分、里程碑、验收标准 | ✅ |
 | [01-wbs.md](03-plan/01-wbs.md) | 工作分解（任务级估时 + 三轮实际耗时回填） | ✅ |
-| [02-test-plan.md](03-plan/02-test-plan.md) | 测试策略、用例清单、夹具（220 tests / 45 suites） | ✅ |
+| [02-test-plan.md](03-plan/02-test-plan.md) | 测试策略、用例清单、夹具（263 tests / 52 suites） | ✅ |
 | [03-release-plan.md](03-plan/03-release-plan.md) | 版本号、发布流程、回滚 | ✅ |
 | [04-risks.md](03-plan/04-risks.md) | 风险登记册 | ✅ |
 
@@ -97,13 +98,14 @@
 
 ---
 
-## 当前文档与实现的对齐状态（2026-11-11 晚，0.2.0）
+## 当前文档与实现的对齐状态（2026-11-12 凌晨，0.2.0 + 未发布改动）
 
-四轮改动（换桌面端凭据路线 → 补 `settings.section` → 加账号池 → E-018/E-019/E-037 实测收口）之后，又做了六轮"自主收口"：只读/写路径分层（`selectPoolAccount()` / `peekPoolAccount()`）、三处用错判据（`this.token` → `activeToken()`）、`recordMeasure()` 去抖、`markDead()` 两个前提条件、`load()` 丢刷新、以及两个扫码入口靠 `login.mode` 认领。带 ✅ 的文档都按真实现重写过，不是初版估测。**E-001 ~ E-039 已无待补项**，回来时需要先确认的只剩三件事：
+四轮改动（换桌面端凭据路线 → 补 `settings.section` → 加账号池 → E-018/E-019/E-037 实测收口）之后，又做了六轮"自主收口"，然后 2026-11-12 处理用户报的三个 bug（换号后旧号消失、客户端退出后 401、扫码加号收不到登录）。**E-001 ~ E-040 已无待补项**，回来时需要先确认的只剩四件事：
 
-1. **扫码端到端未人工确认**：两套协议的取码、轮询、success 分支都只有单测与 OpenCV 解码验证，**用户从未用手机确认过一次登录**。桌面端凭据路线已实机跑通；号池的「扫码添加」也因此未实测。
-2. **号池签到只验过"幂等返回 false"**：2026-11-11 实测当日已领时返回 `{"code":0,"data":{"granted":false}}`，**没验过真的领到 `granted:true`**（需要等到次日北京零点后）。`pool-checkin` 整批流程未在真宿主跑过。
-3. **首字节 60s 超时的落地差距**：`FIRST_BYTE_TIMEOUT_MS = 60_000` 写在协议层，但真链路走 `PiAiAdapter` 时生效的是 `streamIdleTimeoutMs = 300_000`（帧间 idle）。见 [02-data-flow.md §超时与重试](02-design/02-data-flow.md)。
+1. **`/login/mp` 已在服务端下线**（E-040）：Web auth 扫码（协议 B）恒 404，用户微信扫完只会看到「二维码已过期或已被使用」。**加号主路线已改成浏览器 loopback**（ADR-0012 / `protocol/loopback.ts` / `pool-add-browser`），扫码降为备用（IAM 小程序码未受影响）。这条不是我们的 bug，是上游行为变更。
+2. **浏览器登录的"真的登进去"这一段没人跑过**：验过起服务、URL 形状、三条拒收判据（错 state / 错路径 / 假 code），但**"用户在浏览器里真的登录 → 回调带回真 code → 换到真 token → 进池"整段未实测**。同样，扫码登录（协议 A）也从没被真人用手机扫过一次。
+3. **号池签到只验过"幂等返回 false"**：2026-11-11 实测当日已领时返回 `{"code":0,"data":{"granted":false}}`，**没验过真的领到 `granted:true`**（需要等到次日北京零点后）。`pool-checkin` 整批流程未在真宿主跑过。
+4. **首字节 60s 超时的落地差距**：`FIRST_BYTE_TIMEOUT_MS = 60_000` 写在协议层，但真链路走 `PiAiAdapter` 时生效的是 `streamIdleTimeoutMs = 300_000`（帧间 idle）。见 [02-data-flow.md §超时与重试](02-design/02-data-flow.md)。
 
 **已收口的实测**（不再需要回来确认）：
 
@@ -115,5 +117,6 @@
 | E-036 签到 | `POST /api/web/desktop/v1/login/points/grant`（无 body），幂等 |
 | E-038 设备身份 | `X-Client-Device-ID` 是唯一设备身份头 |
 | E-039 倍率 | 真实倍率看 `billing_effective_multiplier`，`billing_multiplier` 是标价 |
+| E-040 扫码链路 | `/login/mp` **恒 404**（路由已下线）；官方换账号走 `/authorize` + loopback；`login_with_authorization_code` 对假 code → 400/200035 |
 
-**M1–M4 已达成，M5 待发布。** 版本 `0.2.0`，`BUILD = 2026-11-11T23:05`，测试 `220 / 45 suites`。
+**M1–M4 已达成，M5 待发布。** 版本 `0.2.0`，`BUILD = 2026-11-12T01:20`，测试 `263 / 52 suites`。

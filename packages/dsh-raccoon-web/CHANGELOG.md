@@ -3,6 +3,107 @@
 本项目遵循「每个版本都写清实测更新」的规矩：**只要网关行为变了，就单独记一条**，
 不能混进「修复」里 —— 因为那不是我们的 bug，是上游改了。
 
+## 0.2.1（2026-11-12）
+
+修用户报的三个 bug（换号后旧号消失、客户端退出后 401、扫码加号收不到登录），
+其中第三个的根因是**上游把 `/login/mp` 这个页面下线了**，于是加号主路线整体换到浏览器 loopback。
+
+### 新增
+
+- **浏览器 loopback 加号**（[ADR-0012](../../docs/02-design/adr/0012-browser-loopback-login.md)）。
+  新增 `src/protocol/loopback.ts`：本机 `127.0.0.1` 起一次性回调服务（随机端口、`state` 64 hex、
+  `timingSafeEqual` 比对、只接受 `GET` + `/auth/callback`、5 分钟超时、`closeAllConnections()`），
+  打开 `https://xiaohuanxiong.com/authorize?...&desktop_callback=loopback&redirect=...&state=...`，
+  用户登录完由浏览器跳回本机，拿到 `code` 后用 `POST /api/web/auth/v1/login_with_authorization_code`
+  换成 token 直接进池。**这就是官方桌面端换账号时走的那条路。**
+- 新增两个 action：`pool-add-browser` / `pool-add-browser-cancel`；`status` 新增 `browser` 块
+  （`{ active, url?, port?, startedAt?, message? }`，**不含 code、不含 token**）。
+- 设置卡「账号池」多一个「浏览器登录」按钮与等待卡片；新增 6 条文案键（zh/en 各 124 键，其中 `pool*` 35 个）。
+- `source` 从 `"qr" | "desktop"` 扩成 `"qr" | "desktop" | "browser"`（`PoolAccount` / `StoredToken` / status / routes）。
+- 登录状态新增诊断字段 `login.lastPoll` / `login.lastPollAt`（`pending` / `logging` / `canceled` / `error:<原文>`），
+  界面上以「最近一次轮询：…」显示。**扫了没反应时这是唯一能区分原因的证据。**
+- `packages/dsh-raccoon-web/test/loopback.test.ts`（**LB-1 ~ LB-35**，5 suite）：`authorizeUrl` 参数顺序、
+  `parseCallback` 的 14 条拒收 reason、`exchangeCode` 的三种结果、`startLoopback` 真起服务打自己的回调。
+
+### 修复
+
+- **换号后池里旧账号消失。** 根因是 `writePool()` 是**整表原子写**，而 `this.accounts` 只是内存快照；
+  内存比磁盘旧时（别处写过 / 上次写失败 / 用户手改文件）直接写就把磁盘上多出来的账号抹掉了。
+  新增 `mergePools(memory, disk)`（同 id 以内存为准，磁盘独有的追加）与 `Host.savePool()`
+  （先合并再整表写），`addPoolAccount` / `pool-toggle` / `pool-test` 全部改走它；
+  `pool-remove` **刻意不合并**（合并会把刚删的号又并回来）。`recordMeasure()` 保留裸写并注明理由。
+- **客户端退出登录后插件仍用内存里的旧 token，报「API 密钥无效」。** `refreshCatalog()` 拿到 401
+  直接 `markDead()`，而用户其实刚在客户端换了号、`auth.json` 里已经是新 token。
+  新增 `rereadDesktopAuth()`：判死之前先重读一次桌面端凭据，**token 字符串变了就换掉并继续**
+  （判据是 token 不是 principal —— 同账号重登也会换新 token）。
+- **`canceled` 被当成"用户取消"收尾。** 官方网页端对 `canceled` 是 `return void c()` —— 立刻换一张新码。
+  我们原来把 `phase` 打成 `none`，用户手机上点一下取消，界面就留一张作废的码。
+  现在 `LoginFlow.reissue()` 自动换码并提示「二维码已刷新，请重新扫码。」，
+  上限 `MAX_REISSUES = 3`（超了收尾成「二维码反复失效，请重新获取。」，避免 2 秒一次的请求风暴）。
+  同时 `start()` 拆成 `start()`（重置计数）+ `beginRound()`（不改计数），否则上限永远触发不了。
+- **`expired_at` 没被采纳。** 服务端在 `logging` 时第一次给出 `expired_at`，官方就在那一刻记下来。
+  新增 `applyServerDeadline()` 把 `deadline` 校正到 `min(服务端, LOGIN_TIMEOUT_MS)`。
+- **`upsertAccount()` 的 `source` 永远保留第一次的来源。** 同一个号先扫码进来、后来用桌面端凭据导入，
+  标成 `qr` 会误导排障。改成跟最后一次来源走。
+- `client.js` 的 `PoolSection` 在浏览器登录进行中时禁用「浏览器登录」按钮，避免起第二个回调服务。
+- **一键签到的逐号结果从来没显示出来。** 宿主一直在 `results` 里返回
+  `{ id, result: "already"|"granted"|"error", message? }`，但 `PoolSection` 只把它丢掉了 ——
+  用户点完按钮看到的就是"转两秒然后什么都没变"。现在每个账号卡片上多一行结果
+  （绿：已签到 / 今日已签；红：签到失败 · 上游原文第一行），新一轮开始前清掉上一轮。
+- **签到失败不记测量状态。** `actionPoolCheckin()` 只把失败塞进 `results`，不动 `measure` ——
+  一个凭据已经废掉的号会继续显示「可用」并继续被选去服务。签到是**用户主动**发起的、
+  每天一次的动作，它拿到的失败信号比对话中途的 `onResponse` 更可信，所以现在也走
+  `classifyMeasure()` + `shouldPersistMeasure()`：`AUTH` → `dead`、限流 → `limited`、
+  超时/网络 → `flaky`、余额不足 → `empty`，HTTP 400 之类与账号无关的仍然不记。
+  写盘走 `savePool()`（合并后整表写），失败不影响结果展示。
+  新增常量 `ACCOUNT_KINDS`（`RaccoonErrorKind` → `MeasureInput.kind` 的映射）：
+  `INVALID_REQUEST` / `ABORTED` 在测量词表里没有对应项 —— 它们说明请求本身不成立，
+  换一个号也一样失败，记成冷却只会白躺一个好号。
+- **`dead` 状态的说明文案写死了"需要重新扫码"。** 号池成员的来源有三种（`qr` / `desktop` / `browser`），
+  只有一种能靠扫码恢复；桌面端凭据过期的人看到这句会被引导到一条走不通的路上。
+  改成来源中性的「登录已失效，需要重新登录这个账号」。
+
+### 适配网关（E-040 实测）
+
+- **`GET /login/mp?code=...` 这个页面在服务端已经不存在了。** 11 组 UA / header 组合（微信 iPhone、
+  微信 Windows、Chrome 131、`curl/8.0`、无 UA、`x-requested-with: com.tencent.mm`、`referer: servicewechat.com`、
+  完整 `sec-fetch-*`）**全部 404**；带 `_rsc=1` 时返回的 RSC 流里明确是
+  `404: This page could not be found.`（`notFound`）。`/login/mp/` 是 308、`/login/mp` 无参是 404，
+  而 `/login` 是 200 —— 坐实**路由下线**，不是鉴权或 UA 问题。
+- **`POST /api/web/auth/v1/login_with_qrcode_code` 对任何 body 恒回 `pending`**：正常 code、
+  `registration_attribution: ""` / `"test"`、时间戳 ±1 小时、`qrcode_code: "abc"`、**`{}` 空对象**
+  全部 `200 {"code":0,"data":{"status":"pending"}}`。**没有任何"码未注册"的信号** —— 所以
+  `qrProtocol: "web"` 现在扫一百次也不会成功，微信端只会显示「二维码已过期或已被使用」。
+- **`/authorize` 与换码端点都活着**：`GET /authorize?login_source=desktop&appname=商汤小浣熊客户端&
+  desktop_callback=loopback&...` → 200 / 32175 字节（标题「客户端授权 | 商汤小浣熊」）；
+  `POST /api/web/auth/v1/login_with_authorization_code` 对假 code → `400 code:200035
+  authorization_code_not_found_error`（**它真的在校验**）。
+- 扫码那条**不删**：`qrProtocol: "iam"` 是另一套命名空间（`appname=商汤小浣熊`、`code` 形如 `qr-...`），
+  不受 `/login/mp` 下线影响，是唯一还能被微信小程序认的。
+
+### 测试
+
+- `263 tests / 52 suites / 263 pass / 0 fail`（0.2.0 时是 220 / 45）。
+  新增 `test/loopback.test.ts` LB-1~LB-35；`test/pool.test.ts` 补 PO-32b / PO-41~PO-43（`mergePools` 三条 +
+  `source` 跟最后一次来源）；`test/host.test.ts` 补 ST-28（换码上限与 `mode` 保持）、ST-29（`deadline` 校正）、
+  ST-30（`lastPoll` 生命周期）；`test/web-auth.test.ts` 补 WA-10b，WA-10/WA-11 改成顶层 `access_token` 主形状。
+- `scripts/smoke-pool.mjs` 补三条（79 → **82 条**）：凭据失效的号在签到结果里是 `error`、
+  签到失败也落成 `measure.state === "dead"`、签到写盘没有抹掉别的号（合并后仍 3 条）。
+  为此让假网关的 `/login/points/grant` 对 `DEAD` 回 401 —— 否则"签到拿到账号级失败"这条路测不到。
+- 真宿主实测（端口 52091，`build 2026-11-12T02:05`）：`pool-add-browser` 起服务 + 返回 `/authorize` URL；
+  错 `state` → 400 且不打换码端点；错路径 → 400；合法 state + 假 code → 502 且页面是
+  `authorization_code_not_found_error`；`pool.total` 未被污染；`pool-checkin` 对真网关跑出
+  `error`（`200003 authorization_verify_error`）+ `already` 两行，且失败号被标成 `dead`。
+
+### 已知限制
+
+- **浏览器登录的"真的登进去"这一段没人跑过**：验过起服务、URL 形状、三条拒收判据、换码端点的错误分支，
+  但"用户在浏览器里真的登录 → 回调带回真 code → 换到真 token → 进池"整段未实测。
+- 扫码登录（协议 A / IAM）从没被真人用手机扫过一次。
+- 一键签到的 `granted: true` 分支未实测（只验过当日已领时的 `granted: false`）。
+
+---
+
 ## 0.2.0（2026-11-11）
 
 多账号池 + 三处上游行为纠偏。**这一版的核心是"一个人用多个号"**：统一管理、额度用完自动换、
@@ -81,8 +182,8 @@
 
 ### 测试
 
-- `220 tests / 45 suites / 220 pass`（0.1.0 时是 168）。新增 `test/pool.test.ts`（PO-1~PO-40）
-  与 `scripts/smoke-pool.mjs`（**12 段 56 条断言**，真 `RaccoonHost` + 假网关）；
+- `263 tests / 52 suites / 263 pass`（0.1.0 时是 168；2026-11-12 加 `test/loopback.test.ts` LB-1~LB-35）。新增 `test/pool.test.ts`（PO-1~PO-40）
+  与 `scripts/smoke-pool.mjs`（**13 段 82 条断言**，真 `RaccoonHost` + 假网关）；
   `test/chat.test.ts` 新增 CH-37a~CH-37f 覆盖 E-018 / E-019 的六条分支。
 - `smoke-pool.mjs` 第 6.5 段：连查五次 `status`，断言当前号一致且 `pool/pick` **至多 1 条**
   —— 只读路径不许放大选号副作用。第 6.6 段：造"池成员 401"与"无池成员 + 桌面端凭据 401"两种现场，

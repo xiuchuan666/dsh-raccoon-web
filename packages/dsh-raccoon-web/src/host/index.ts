@@ -21,13 +21,13 @@
 import type { LlmRegistrar } from "./publish.js";
 import type { Logger } from "./log.js";
 import type { AuthSource, SettingsHandle } from "./settings.js";
-import type { StatusDesktopAuth, StatusModel, StatusPool, StatusPoolAccount, StatusQuota, StatusSnapshot } from "./status.js";
+import type { StatusBrowser, StatusDesktopAuth, StatusModel, StatusPool, StatusPoolAccount, StatusQuota, StatusSnapshot } from "./status.js";
 import type { ActionResult, WebServerLike } from "./routes.js";
 
 import { buildDiagnostics } from "./status.js";
 import { loginBlock, registerRoutes } from "./routes.js";
 import { createTtlCache } from "./cache.js";
-import { LoginFlow } from "./login-flow.js";
+import { LoginFlow, type LoginMode } from "./login-flow.js";
 import { tokenTag } from "./log.js";
 import { Publisher, rosterSignature, type PublishAccountResolver } from "./publish.js";
 import { PROBE_PNG_BASE64 } from "./solid-png.js";
@@ -35,6 +35,7 @@ import { clearToken, readProbes, readToken, recordProbe, saveToken, type StoredT
 import {
   classifyMeasure,
   isCooling,
+  mergePools,
   readPool,
   shouldPersistMeasure,
   sortForUse,
@@ -42,17 +43,40 @@ import {
   writePool,
   type PoolAccount,
   type PoolQuota,
+  type PoolSource,
 } from "./pool.js";
 import { toDescriptors, type ModelDescriptor } from "../provider/roster.js";
 import { FALLBACK_MODELS } from "../provider/fallback-roster.js";
 import { fetchCatalog, flattenCatalog } from "../protocol/catalog.js";
 import { readDesktopAuth, type DesktopAuth } from "../protocol/desktop-auth.js";
 import { fetchBalance, fetchBills, grantDaily, todayGranted } from "../protocol/points.js";
-import { applyThinking, chatStream, sessionIdFor } from "../protocol/chat.js";
+import { applyThinking, chatStream, jwtClaims, principalOf, sessionIdFor } from "../protocol/chat.js";
 import { renderQrSvg } from "../protocol/qr.js";
+import { validateToken } from "../protocol/iam.js";
+import {
+  exchangeCode,
+  startLoopback,
+  type LoopbackResult,
+  type LoopbackSession,
+} from "../protocol/loopback.js";
 import { CATALOG_TTL_MS, DEFAULT_CONTEXT_CAP, PROVIDER_ID, QUOTA_TTL_MS } from "../protocol/consts.js";
-import { RaccoonError } from "../protocol/errors.js";
+import { RaccoonError, type RaccoonErrorKind } from "../protocol/errors.js";
 import type { RaccoonModel } from "../protocol/catalog.js";
+
+/**
+ * `RaccoonErrorKind` → `MeasureInput.kind` 的映射。
+ *
+ * 两套词表刻意不同：错误分类面向"这次请求发生了什么"，测量分类面向"这个账号
+ * 现在能不能用"。`INVALID_REQUEST` 与 `ABORTED` 在后者里没有对应项 —— 它们
+ * 说明请求本身不成立，换一个号也一样失败，记成冷却只会白躺一个好号。
+ */
+const ACCOUNT_KINDS: Partial<Record<RaccoonErrorKind, "AUTH" | "RATE_LIMIT" | "SERVER" | "TIMEOUT" | "TRANSPORT">> = {
+  AUTH: "AUTH",
+  RATE_LIMIT: "RATE_LIMIT",
+  SERVER: "SERVER",
+  TIMEOUT: "TIMEOUT",
+  TRANSPORT: "TRANSPORT",
+};
 
 /** 宿主装配参数。 */
 export interface HostOptions {
@@ -147,6 +171,21 @@ export class RaccoonHost {
   private poolQuota = new Map<string, PoolQuota>();
   /** 当前在服务的池成员 id。`poolEnabled` 关掉时恒 undefined。 */
   private poolActiveId: string | undefined;
+  /**
+   * 在途的浏览器 loopback 登录（ADR-0012）。
+   *
+   * 只有一份：同一时刻只允许一个"浏览器登录"在等回调。理由与 `LoginFlow`
+   * 的 `generation` 相同 —— 两个回调服务同时开着，用户不知道哪个页面在等，
+   * 而结果会写进同一个地方。再点一次就先关掉旧的。
+   *
+   * `mode` 决定结果去哪：`primary` = 换当前账号（写 `token.json`），
+   * `pool` = 往号池加一个成员（不动当前账号，ADR-0010 §4）。
+   */
+  private browserLogin:
+    | { session: LoopbackSession; close: () => void; startedAt: number; mode: LoginMode }
+    | undefined;
+  /** 浏览器登录给用户看的一句话（成功/失败/取消）。 */
+  private browserNote: string | undefined;
   private probes = new Map<string, boolean>();
   private catalog: CatalogState = { models: [], descriptors: [], ready: false };
   private quota: StatusQuota = {
@@ -341,6 +380,9 @@ export class RaccoonHost {
     this.disposed = true;
     this.unsubscribeRoutes?.();
     this.unsubscribeRoutes = undefined;
+    // 在途的浏览器回调服务必须收掉：它是真的在监听一个端口，
+    // 插件卸载后还开着就是一个孤立的监听者（也是端口泄漏）。
+    this.closeBrowserLogin("插件已卸载。");
     this.loginFlow.dispose();
     this.publisher.dispose("unload");
     this.catalogCache.clear();
@@ -352,7 +394,7 @@ export class RaccoonHost {
   /**
    * 全部 action 的唯一入口。
    *
-   * 十六个 `case`、十四个 action 名（`set-setting` 与 `set-enabled` 同体）。
+   * 十八个 `case`、十六个 action 名（`set-setting` 与 `set-enabled` 同体）。
    * 任何一个 action 都不该让宿主进程崩 —— 全部包在 try 里，错误变成
    * `{ok:false, error}`。UI 直接把 error 显示出来。
    *
@@ -408,6 +450,10 @@ export class RaccoonHost {
           return await this.actionProbeVision(body);
         case "pool-add-start":
           return await this.actionPoolAddStart();
+        case "pool-add-browser":
+          return await this.actionPoolAddBrowser();
+        case "pool-add-browser-cancel":
+          return this.actionPoolAddBrowserCancel();
         case "pool-import-desktop":
           return await this.actionPoolImportDesktop();
         case "pool-toggle":
@@ -584,6 +630,7 @@ export class RaccoonHost {
       },
       desktopAuth: this.desktopStatus,
       pool: this.poolSnapshot(),
+      browser: this.browserSnapshot(),
       ...(this.catalog.error === undefined ? {} : { catalogError: this.catalog.error }),
     };
     return { ...base, diagnostics: buildDiagnostics({ build: base.build, version: base.version, snapshot: base }) };
@@ -649,6 +696,20 @@ export class RaccoonHost {
       // 2. 桌面端凭据过期时不能叫他"重新扫码" —— 他从来没扫过码，
       //    该做的是打开官方客户端刷新（ADR-0008 只读、不代持，我们续不了）。
       if (kind === "AUTH" && this.peekPoolAccount() === undefined) {
+        // **判死之前先重读一次桌面端凭据**（2026-11-12 补）。
+        //
+        // 现场：用户在官方客户端里退出账号 A、登录账号 B，然后回到 DSH 发消息。
+        // 我们内存里的 `this.token` 还是 A 的（只在上次 `resolveToken()` 时读过），
+        // 于是 401 → 直接 `markDead("客户端凭据已失效…")`，让用户去重登客户端 ——
+        // 可他明明刚登完。更糟的是这个 `expired` 相位会一直挂着。
+        //
+        // 重读一次几乎零成本（读一个本地小文件），而且能把"客户端换了号"
+        // 与"客户端凭据真失效"这两件事分开。
+        const reread = await this.rereadDesktopAuth();
+        if (reread) {
+          this.logger.info("catalog/auth-recovered", { reason: "desktop credential changed" });
+          return;
+        }
         this.loginFlow.markDead(
           this.token?.source === "desktop"
             ? "客户端凭据已失效，请打开官方客户端重新登录。"
@@ -656,6 +717,55 @@ export class RaccoonHost {
         );
       }
     }
+  }
+
+  /**
+   * 401 之后重读桌面端凭据。**读到且与内存里不同才算"救回来了"。**
+   *
+   * 与 `resolveToken()` 的区别：
+   * - `resolveToken()` 是启动/主动刷新时走的完整三态决策，会改 `desktopIgnored`
+   *   之类的字段、会打 `token/desktop` 日志、会 `markReady()`。
+   * - 这里是**一条窄路**：只问"客户端换号了吗"。换了就把新 token 换上、
+   *   重建名册；没换就返回 `false`，让调用方按原来的逻辑判死。
+   *
+   * 判断"换了"的判据是 token 字符串本身不相等，不是 principal —— 同一个账号
+   * 重新登录也会拿到新 token（旧的可能被服务端拉黑了），这种情况也该重试一次。
+   */
+  private async rereadDesktopAuth(): Promise<boolean> {
+    if (this.options.settings.get().authSource === "qr") return false;
+    const auth = await readDesktopAuth({
+      now: this.now,
+      ...(this.options.desktopHome === undefined ? {} : { home: this.options.desktopHome }),
+    }).catch(() => undefined);
+    if (auth === undefined) return false;
+    const expired = auth.expiresAt !== undefined && auth.expiresAt - 60_000 <= this.now();
+    if (expired) return false;
+    if (auth.token === this.token?.token) return false;
+
+    this.desktopAuth = auth;
+    this.desktopStatus = {
+      found: true,
+      path: auth.source,
+      ...(auth.expiresAt === undefined ? {} : { expiresAt: auth.expiresAt }),
+    };
+    this.token = {
+      schemaVersion: 1,
+      token: auth.token,
+      kind: auth.kind,
+      savedAt: this.now(),
+      ...(auth.expiresAt === undefined ? {} : { expiresAt: auth.expiresAt }),
+      ...(auth.principal === undefined ? {} : { principal: auth.principal }),
+      source: "desktop",
+    };
+    this.loginFlow.markReady();
+    this.logger.info("token/desktop-reread", {
+      token: tokenTag(auth.token),
+      path: auth.source,
+      principal: auth.principal ?? "-",
+    });
+    // 名册里的 session id 是按 principal 算的，换了号必须重建。
+    this.syncPublisher();
+    return true;
   }
 
   private async loadCatalog(): Promise<CatalogState> {
@@ -733,13 +843,34 @@ export class RaccoonHost {
    * 新成员一律 `enabled: false` —— 见 ADR-0010 §3：本机登录着不等于
    * 用户同意拿它去花积分，必须由用户勾选一次。
    */
-  private async addPoolAccount(token: StoredToken, source: "qr" | "desktop"): Promise<void> {
+  /**
+   * 落盘号池。**先与磁盘合并，再整表写。**
+   *
+   * `writePool()` 是整表原子写，而 `this.accounts` 是内存快照。两者可能不同步
+   * （插件重启后别处写过、上一次写入失败只更新了内存、用户手改过文件）。
+   * 直接写内存那份，磁盘上多出来的账号就被抹掉了 —— 用户看到的现象是
+   * "导入第二个账号，第一个账号没了"。账号没被删，是被一张过期的整表覆盖了。
+   *
+   * 合并之后再更新 `this.accounts`，让内存与磁盘对齐（否则界面上看不到
+   * 磁盘里那个号，下次写入又把它抹掉）。
+   */
+  private async savePool(): Promise<void> {
+    const disk = await readPool().catch(() => [] as PoolAccount[]);
+    this.accounts = mergePools(this.accounts, disk);
+    await writePool(this.accounts);
+  }
+
+  private async addPoolAccount(token: StoredToken, source: PoolSource): Promise<void> {
     const principal = token.principal ?? "";
     if (principal.length === 0) {
       this.logger.warn("pool/add-no-principal", { source });
       return;
     }
-    this.accounts = upsertAccount(this.accounts, {
+    // 先把磁盘上的号并进来再 upsert：`this.accounts` 可能比磁盘旧，
+    // 直接 upsert 一份旧表再整表写，就会把磁盘上别的账号抹掉（"导入第二个号，
+    // 第一个号消失"就是这么来的）。
+    const disk = await readPool().catch(() => [] as PoolAccount[]);
+    this.accounts = upsertAccount(mergePools(this.accounts, disk), {
       token: token.token,
       kind: token.kind,
       principal,
@@ -747,7 +878,7 @@ export class RaccoonHost {
       source,
       now: this.now(),
     });
-    await writePool(this.accounts).catch((error: unknown) => {
+    await this.savePool().catch((error: unknown) => {
       this.logger.error("pool/write-failed", { message: messageOf(error) });
     });
     const added = this.accounts.find((a) => a.principal === principal);
@@ -842,7 +973,7 @@ export class RaccoonHost {
    * （`snapshot()` 每 20 秒被轮询一次）。
    */
   private displayToken():
-    | { principal?: string; kind?: "access_token" | "xhx_token"; expiresAt?: number; source?: "qr" | "desktop" }
+    | { principal?: string; kind?: "access_token" | "xhx_token"; expiresAt?: number; source?: "qr" | "desktop" | "browser" }
     | undefined {
     const pooled = this.peekPoolAccount();
     if (pooled !== undefined) {
@@ -874,6 +1005,9 @@ export class RaccoonHost {
     // 日志刷成 `pool/measure ok` 的海洋。
     if (!shouldPersistMeasure(pooled.measure, measure)) return;
     this.accounts = this.accounts.map((a) => (a.id === pooled.id ? { ...a, measure } : a));
+    // 这里**刻意**用裸 `writePool()` 而不是 `savePool()`：这条路径挂在每个
+    // 响应上，合并要先读一次磁盘，等于每次对话多一次读。而它只改 `measure`
+    // 一个字段 —— 内存表比磁盘旧的风险在这个字段上无害（冷却记录会过期）。
     void writePool(this.accounts).catch(() => undefined);
     this.logger.info("pool/measure", { id: pooled.id.slice(0, 8), state: measure.state, status });
     // 这个号刚被判死/冷却：换下一个，并且让名册换实例（设备身份要跟着换）。
@@ -938,6 +1072,145 @@ export class RaccoonHost {
     return { ok: true, login: snapshot, pool: this.poolSnapshot() };
   }
 
+  /**
+   * 加一个池成员（浏览器 loopback，ADR-0012）。
+   *
+   * 这条路 2026-11-12 起是"加号"的主路线：扫码那条（`/login/mp`）在服务端
+   * 侧已经 404，用户微信扫出来的只有"二维码已过期或已被使用"。
+   *
+   * 流程：本机起一次性回调服务 → 把 `/authorize?...&redirect=http://127.0.0.1:<port>/auth/callback&state=...`
+   * 交给用户 → 用户在浏览器里正常登录 → 浏览器重定向回本机 → 我们拿 `code`
+   * 调 `login_with_authorization_code` 换 token → 加进池。
+   *
+   * 三条纪律：
+   * 1. **不阻塞**：`wait` 是后台跑的，action 立刻返回 `browser.url` 让界面能显示。
+   * 2. **只有一份**：再点一次先关掉上一轮（否则两个回调服务同时等，用户不知道哪个页面在等）。
+   * 3. **失败要落到界面上**：结果写进 `browserSnapshot().message`，用户回来能看到原因。
+   */
+  private async actionPoolAddBrowser(mode: LoginMode = "pool"): Promise<ActionResult> {
+    this.closeBrowserLogin("已重新发起浏览器登录。");
+
+    let started: Awaited<ReturnType<typeof startLoopback>>;
+    try {
+      started = await startLoopback({
+        exchange: (code) => exchangeCode(code, this.fetchImpl),
+        now: this.now,
+      });
+    } catch (error) {
+      const message = messageOf(error);
+      this.logger.error("pool/browser-listen-failed", { message });
+      this.browserNote = `无法在本机起登录回调服务：${message}`;
+      return { ok: false, error: this.browserNote, browser: this.browserSnapshot() };
+    }
+
+    const { session, wait, close } = started;
+    this.browserLogin = { session, close, startedAt: this.now(), mode };
+    this.browserNote = "已打开浏览器授权页，请在浏览器里完成登录。";
+    this.logger.info("pool/browser-start", { port: session.port, mode });
+
+    // 后台等结果。`void` + 自己的 catch：`wait` 本身不会 reject，
+    // 但 `handleBrowserResult` 里会写盘，写盘可能失败。
+    void wait
+      .then(async (result) => {
+        await this.handleBrowserResult(session, result);
+      })
+      .catch((error: unknown) => {
+        this.logger.error("pool/browser-failed", { message: messageOf(error) });
+        this.browserNote = `浏览器登录失败：${messageOf(error)}`;
+        this.browserLogin = undefined;
+      });
+
+    return { ok: true, browser: this.browserSnapshot(), pool: this.poolSnapshot() };
+  }
+
+  /** 用户点了取消。 */
+  private actionPoolAddBrowserCancel(): ActionResult {
+    if (this.browserLogin === undefined) {
+      return { ok: false, error: "当前没有在等待浏览器登录。", browser: this.browserSnapshot() };
+    }
+    this.closeBrowserLogin("已取消浏览器登录。");
+    this.logger.info("pool/browser-cancel");
+    return { ok: true, browser: this.browserSnapshot(), pool: this.poolSnapshot() };
+  }
+
+  /** 关掉在途的浏览器登录（若在）。`note` 会显示在界面上。 */
+  private closeBrowserLogin(note: string): void {
+    const current = this.browserLogin;
+    if (current === undefined) return;
+    this.browserLogin = undefined;
+    this.browserNote = note;
+    try {
+      current.close();
+    } catch {
+      // `close()` 只是收摊，失败不影响任何状态。
+    }
+  }
+
+  /**
+   * 浏览器回调到齐之后的收尾。
+   *
+   * 判据与 `LoginFlow.complete()` 一致：**`validateToken()` 是唯一权威**。
+   * 换到 token 不等于能用 —— IAM 发的 JWT 与业务网关认的 token 不完全等价，
+   * 直接加进池会让用户在这个号被选中时才发现 401。
+   */
+  private async handleBrowserResult(session: LoopbackSession, result: LoopbackResult): Promise<void> {
+    // 这一轮已经不是"当前这一轮"了（用户又点了一次 / 取消了）：结果丢弃。
+    if (this.browserLogin?.session.state !== session.state) return;
+    this.browserLogin = undefined;
+
+    if (result.status !== "success" || result.accessToken === undefined) {
+      this.browserNote = result.message ?? "浏览器登录未完成。";
+      this.logger.info("pool/browser-result", { status: result.status });
+      return;
+    }
+
+    const valid = await validateToken(result.accessToken, this.fetchImpl).catch(() => false);
+    if (!valid) {
+      this.browserNote = "账号已授权，但模型网关拒绝了这次登录令牌。请重试；若持续出现，请稍后再试。";
+      this.logger.warn("pool/browser-invalid-token");
+      return;
+    }
+
+    const claims = jwtClaims(result.accessToken);
+    const exp = typeof claims?.["exp"] === "number" ? (claims["exp"] as number) * 1000 : undefined;
+    const principal = principalOf(result.accessToken);
+    if (principal === undefined || principal.length === 0) {
+      this.browserNote = "登录成功，但令牌里没有账号标识，无法加入号池。";
+      this.logger.warn("pool/browser-no-principal");
+      return;
+    }
+
+    await this.addPoolAccount(
+      {
+        schemaVersion: 1,
+        token: result.accessToken,
+        kind: "access_token",
+        savedAt: this.now(),
+        ...(exp === undefined ? {} : { expiresAt: exp }),
+        principal,
+        source: "browser",
+      },
+      "browser",
+    );
+    this.browserNote = `已加入账号池（${principal.slice(0, 8)}）。新加的号默认未启用，勾上才会拿去发请求。`;
+    this.logger.info("pool/browser-added", { principal: principal.slice(0, 8) });
+  }
+
+  /** 浏览器登录状态（给 status / action 返回用）。**不含 code、不含 token。** */
+  private browserSnapshot(): StatusBrowser {
+    const current = this.browserLogin;
+    if (current === undefined) {
+      return { active: false, ...(this.browserNote === undefined ? {} : { message: this.browserNote }) };
+    }
+    return {
+      active: true,
+      url: current.session.url,
+      port: current.session.port,
+      startedAt: current.startedAt,
+      ...(this.browserNote === undefined ? {} : { message: this.browserNote }),
+    };
+  }
+
   /** 把官方桌面客户端的凭据加进池（用户明确点了"导入"才走这条）。 */
   private async actionPoolImportDesktop(): Promise<ActionResult> {
     const auth = await readDesktopAuth({
@@ -980,7 +1253,7 @@ export class RaccoonHost {
     }
     this.accounts = next;
     try {
-      await writePool(this.accounts);
+      await this.savePool();
     } catch (error) {
       // 落盘失败要把内存回滚：否则界面显示已启用、重启后又变回未启用，
       // 用户会以为是插件在随机忘事。
@@ -996,8 +1269,15 @@ export class RaccoonHost {
   private async actionPoolRemove(body: Record<string, unknown>): Promise<ActionResult> {
     const id = typeof body["id"] === "string" ? body["id"] : "";
     if (id.length === 0) return { ok: false, error: "缺少 id 参数" };
-    const next = this.accounts.filter((a) => a.id !== id);
-    if (next.length === this.accounts.length) {
+    // 先并表再过滤：如果内存比磁盘旧，直接过滤内存那份再整表写，
+    // 会把磁盘上**别的**账号一起抹掉（同 addPoolAccount 的理由）。
+    // 注意这里**不能**用 `savePool()` —— 它会把磁盘并回来，删掉的号又活了。
+    const disk = await readPool().catch(() => [] as PoolAccount[]);
+    const merged = mergePools(this.accounts, disk);
+    const next = merged.filter((a) => a.id !== id);
+    if (next.length === merged.length) {
+      // 内存里没有、磁盘上也没有 —— 可能是别人已经删过了。
+      this.accounts = merged;
       return { ok: false, error: "没有这个账号", pool: this.poolSnapshot() };
     }
     this.accounts = next;
@@ -1027,6 +1307,11 @@ export class RaccoonHost {
     }
     const results: Array<{ id: string; result: "already" | "granted" | "error"; message?: string }> = [];
     let touched = false;
+    // 这一轮要不要把测量结果落盘。签到是**用户主动**发起的、每天一次的动作，
+    // 它拿到的失败信号比对话中途的 `onResponse` 更可信（后者可能是上游抖动）：
+    // 一个号的凭据真的废了，用户点完签到就该在卡片上看到「凭据失效」，
+    // 而不是继续显示上次的「可用」并继续被选去服务。
+    let measured = false;
     for (const account of this.accounts) {
       const id = account.id;
       try {
@@ -1056,7 +1341,26 @@ export class RaccoonHost {
           });
         }
       } catch (error) {
-        results.push({ id, result: "error", message: messageOf(error) });
+        const text = messageOf(error);
+        results.push({ id, result: "error", message: text });
+        // 把失败翻译成测量状态。`classifyMeasure()` 只认「与账号有关」的失败：
+        // 网络抖动 → `flaky`（30 分钟后自动回池）、凭据失效 → `dead`（要靠
+        // 手动「测试」或重新登录才能回池）、余额不足 → `empty`（到北京零点）。
+        // HTTP 400 之类与账号无关的会返回 `undefined`，那种情况不改状态。
+        // `MeasureInput.kind` 只收与账号有关的几种（见 `pool.ts` 的
+        // `MeasureInput`）。`INVALID_REQUEST` / `ABORTED` 说的是"这次请求本身
+        // 不成立"，与这个号能不能用无关 —— 归到 `undefined`，只留 status 参与判断。
+        const kind = error instanceof RaccoonError ? ACCOUNT_KINDS[error.kind] : undefined;
+        const measure = classifyMeasure({
+          ...(kind === undefined ? {} : { kind }),
+          status: error instanceof RaccoonError && error.status !== undefined ? error.status : 0,
+          bodyText: text,
+          now: this.now(),
+        });
+        if (measure !== undefined && shouldPersistMeasure(account.measure, measure)) {
+          this.accounts = this.accounts.map((a) => (a.id === id ? { ...a, measure } : a));
+          measured = true;
+        }
       }
     }
     this.logger.info("pool/checkin", {
@@ -1065,10 +1369,16 @@ export class RaccoonHost {
       already: results.filter((r) => r.result === "already").length,
       failed: results.filter((r) => r.result === "error").length,
     });
-    if (touched) {
+    if (measured) {
+      // 合并后写盘：签到是低频动作，多读一次盘换来"不抹掉别的号"是划算的
+      // （与 `actionPoolTest()` 同一理由）。写失败不影响结果展示。
+      await this.savePool().catch(() => undefined);
+    }
+    if (touched || measured) {
       // 当前账号的余额也可能被这轮改到了（如果它就是池成员）。
       this.quotaCache.clear();
       void this.refreshQuota({ force: false }).catch(() => undefined);
+      // 有号被判死/冷却 → 当前选中的那个可能已经不能用了，必须让名册重建。
       this.syncPublisher();
     }
     return { ok: true, pool: this.poolSnapshot(), results };
@@ -1106,7 +1416,8 @@ export class RaccoonHost {
 
     const measure = classifyMeasure({ status, ...(message === undefined ? {} : { bodyText: message }), now: this.now() });
     this.accounts = this.accounts.map((a) => (a.id === id ? { ...a, ...(measure === undefined ? {} : { measure }) } : a));
-    await writePool(this.accounts).catch(() => undefined);
+    // 手动点「测试」是一次用户动作，多一次读盘换"不抹掉别的账号"是划算的。
+    await this.savePool().catch(() => undefined);
     this.logger.info("pool/test", {
       id: id.slice(0, 8),
       ok,

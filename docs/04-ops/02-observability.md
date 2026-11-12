@@ -1,6 +1,6 @@
 # 观测与日志
 
-最后更新: 2026-11-11（事件名按源码 45 处 log 调用、44 个事件名逐一核对）
+最后更新: 2026-11-12（事件名按源码逐条 grep、53 个事件名核对）
 状态: 已定稿
 
 > 一句话：**三个观测面各管一件事 —— 日志管"发生了什么"，status 管"现在是什么"，诊断块管"用户能贴给我什么"。**
@@ -52,9 +52,9 @@ createLogger(sink: LogSink | undefined, debugEnabled = false): Logger
 - `debug` 级别默认关，由 `settings.debugLog` 控制（`logger.setDebug(enabled)`）。
 - 四种级别：`debug` / `info` / `warn` / `error`。
 
-### 1.3 全部 44 个事件（源码逐条核对，2026-11-11）
+### 1.3 全部 53 个事件（源码逐条核对，2026-11-12）
 
-> 核对方式：在 `packages/dsh-raccoon-web/src/` 下 grep `logger.(debug|info|warn|error)(` 共 **45 处调用、44 个不同事件名**（`publish/release` 与 `publish/dispose` 由同一个三元表达式产生）。其中号池的 10 个是 2026-11-11 加的。
+> 核对方式：`grep -rhoP 'logger\.(debug|info|warn|error)\(\s*"[a-z0-9/.-]+"' packages/dsh-raccoon-web/src/ | grep -oP '"[a-z0-9/.-]+"' | sort -u` —— 当前 **53 个不同事件名**（`publish/release` 与 `publish/dispose` 由同一个三元表达式产生，各算一个）。其中号池基础 10 个是 2026-11-11 加的，浏览器 loopback 6 个 + 重读凭据 1 个 + 换码上限 1 个 + 目录自愈 1 个是 2026-11-12 加的。
 
 **插件生命周期（`src/index.ts`）**
 
@@ -74,6 +74,7 @@ createLogger(sink: LogSink | undefined, debugEnabled = false): Logger
 | `token/desktop-expired` | warn | `path`, `reason` | 读到了但过期，回落扫码 |
 | `token/desktop-missing` | info | `reason` | 六条候选路径都没读到 |
 | `token/qr` | info | `token`(tag), `principal`, `reason` | 用了落盘的扫码 token |
+| `token/desktop-reread` | info | `token`(tag), `path`, `principal` | **401 之后重读桌面端凭据并换了新 token**（`rereadDesktopAuth()`，判据是 token 字符串变了，不是 principal） |
 | `bootstrap/failed` | error | `message` | 冷启动整体失败（不致命，插件仍加载） |
 
 **登录流程（`src/host/login-flow.ts`；`login/start` 在 `index.ts`）**
@@ -90,6 +91,7 @@ createLogger(sink: LogSink | undefined, debugEnabled = false): Logger
 | `login/error` | warn | `message` | 状态机进 error |
 | `login/poll-threw` | warn | `message` | 轮询异常（**网络抖动，继续 pending**） |
 | `login/logout` | info | — | 用户点了退出 |
+| `login/reissue-exhausted` | warn | `reissues` | `canceled` 自动换码超过 `MAX_REISSUES = 3`，收尾成「二维码反复失效」 |
 
 **名册发布（`src/host/publish.ts`）**
 
@@ -108,6 +110,7 @@ createLogger(sink: LogSink | undefined, debugEnabled = false): Logger
 | --- | --- | --- | --- |
 | `catalog/loaded` | info | `models` | 目录拉到了 |
 | `catalog/failed` | warn | `kind`, `message` | 目录失败（AUTH 时**可能** `markDead`：号池在服务时不判死，见 §4.1） |
+| `catalog/auth-recovered` | info | `reason` | 401 后重读桌面端凭据成功，**不判死**直接继续 |
 | `quota/failed` | warn | `message` | 余额失败（不致命） |
 | `probe/vision` | info | `model`, `verdict`(`yes`/`no`/`unknown`) | 识图探测结果 |
 
@@ -125,6 +128,14 @@ createLogger(sink: LogSink | undefined, debugEnabled = false): Logger
 | `pool/checkin` | info | `total`, `granted`, `already`, `failed` | 一键签到汇总（**每号一行结果只进 HTTP 响应，不进日志**） |
 | `pool/test` | info | `id`, `state`, `status` | 手动测试某个号 |
 | `pool/write-failed` | error | `message` | `accounts.json` 写失败（`toggle` 会回滚内存，`remove` 不回滚） |
+| `pool/browser-start` | info | `port`, `mode` | 起了本机回调服务并给出 `/authorize` URL |
+| `pool/browser-listen-failed` | error | `message` | 回调服务起不来（端口/权限），`browser.message` 会带原因 |
+| `pool/browser-cancel` | info | — | 用户点了「取消等待」 |
+| `pool/browser-result` | info | `status` | 回调结果（`success` / `canceled` / `expired` / `error`） |
+| `pool/browser-failed` | error | `message` | 处理回调时抛异常（`handleBrowserResult` 的 `.catch`），`browser.message` 写「浏览器登录失败：…」 |
+| `pool/browser-invalid-token` | warn | — | 换到 token 了但模型网关拒绝（`validateToken()` 失败） |
+| `pool/browser-no-principal` | warn | — | 换到 token 了但 JWT 里没有 `sub`，无法入池 |
+| `pool/browser-added` | info | `id`(前 8 位), `total` | 浏览器登录成功并入池（新号 `enabled:false`） |
 
 **动作与路由（`src/host/index.ts` / `src/host/routes.ts`）**
 
@@ -173,7 +184,7 @@ function tokenTag(token: string | undefined): string {
 **正常冷启动（桌面端凭据）**
 
 ```
-[raccoon-web] apply version=0.1.0 build=2026-11-06T12:35
+[raccoon-web] apply version=0.2.1 build=2026-11-12T01:35
 [raccoon-web] mount/routes
 [raccoon-web] token/desktop token=a1b2c3d4 path=... exp=1796362428000 reason=bootstrap
 [raccoon-web] catalog/loaded models=6
@@ -225,62 +236,96 @@ GET /plugins/dsh-raccoon-web/status
 
 响应头带 `Content-Type: application/json; charset=utf-8` + `Cache-Control: no-store`。
 
-### 2.2 完整形状
+### 2.2 完整形状（2026-11-12 真宿主实测，11 个顶层键）
 
 ```jsonc
 {
-  "build": "2026-11-06T12:35",          // 与 client.js 里的 BUILD 对照
-  "version": "0.1.0",
+  "build": "2026-11-12T01:35",           // 与 client.js 里的 BUILD 对照
+  "version": "0.2.1",
   "login": {
     "phase": "ready",                    // none|pending|logging|ready|expired|error（**没有 dead**）
-    "source": "desktop",                 // qr|desktop，未登录时缺省
-    "principal": "pu-01a19",             // 只给前 8 位
+    "mode": "primary",                   // primary|pool —— 这张码/这一轮是给谁用的
+    "source": "desktop",                 // qr|desktop|browser，未登录时缺省
+    "principal": "pu-01a1c",             // 只给前 8 位
     "kind": "access_token",
-    "expiresAt": 1796362428000,
+    "expiresAt": 1797004338000,
     "qrSvg": "<svg ...>",                // 仅 pending|logging
-    "deadline": 1793937129000,           // 仅 pending|logging
-    "message": "..."                     // 仅 expired|error
+    "deadline": 1794415875926,           // 仅 pending|logging
+    "lastPoll": "pending",               // 仅 pending|logging；pending|logging|canceled|error:<原文>
+    "lastPollAt": 1794415580213,         // 仅 pending|logging
+    "message": "..."                     // 仅 expired|error|ready（ready 的 message 可选）
   },
   "publish": "published",                // disabled|not-configured|published
   "catalogReady": true,
   "catalogError": "...",                 // 可选，仅在失败时
   "models": [                            // **未登录时也非空**（走 fallback 名册）
     {
-      "id": "sn-kimi-k3",
-      "name": "Kimi-K3",
+      "id": "sn-sensenova-6-8-flash",
+      "name": "SenseNova-6.8-Flash",     // 来自上游 description
       "vision": true,
-      "multiplier": 1,
-      "contextWindow": 128000,           // 已按 contextCap 截断
-      "maxTokens": 64000,
+      "multiplier": 0.5,                 // billing_effective_multiplier
+      "contextWindow": 256000,           // 已按 contextCap 截断
+      "maxTokens": 63999,
       "probed": true                     // 可选，实测过才有
     }
   ],
   "quota": {
-    "available": 11682,
-    "permanent": 10500,
-    "daily": 1182,
-    "dailyGranted": true,                // true|false|null（null = 不知道）
-    "at": 1793936829945,
+    "available": 9300,
+    "permanent": 9000,
+    "daily": 300,
+    "dailyGranted": false,               // true|false|null（null = 不知道）
+    "at": 1794418119880,
     "error": "..."                       // 可选
   },
   "settings": {
     "enabled": true,
     "reasoning": true,
     "visionProbeOverride": false,
-    "contextCap": 128000,
+    "contextCap": 1000000,
     "debugLog": false,
     "authSource": "auto",                // auto|desktop|qr
-    "qrProtocol": "web"                  // web|iam
+    "qrProtocol": "web",                 // web|iam
+    "poolEnabled": false                 // 第八键，2026-11-11 加
   },
   "desktopAuth": {
     "found": true,
     "path": "C:\\Users\\...\\auth.json",
-    "expiresAt": 1796362428000,
+    "expiresAt": 1797004338000,
     "reason": "..."                      // 可选
+  },
+  "pool": {
+    "enabled": false,
+    "ready": true,                       // 有凭据可用（能挑出号）
+    "total": 2,
+    "enabledCount": 1,
+    "activeId": "7b86c89281dbdf94",      // 可选，只在这个实例正在用某个池成员时给
+    "note": "...",                       // 可选
+    "accounts": [
+      {
+        "id": "7b86c89281dbdf94",        // sha256(principal) 前 16 位
+        "principal": "pu-01a19",         // 前 8 位
+        "expiresAt": 1796362428000,
+        "addedAt": 1794401118286,
+        "enabled": true,
+        "device": "c9012c1d",            // 去掉 raccoon- 前缀后 8 位
+        "source": "desktop",             // qr|desktop|browser
+        "active": false,                 // 当前这个实例是否正在用它
+        "measure": { "state": "ok", "at": 1794411243247, "note": "正常" }
+      }
+    ]
+  },
+  "browser": {                           // 浏览器 loopback 加号（ADR-0012）
+    "active": false,                     // true = 本机回调服务正在听
+    "url": "https://xiaohuanxiong.com/authorize?...",  // 仅 active
+    "port": 64023,                       // 仅 active
+    "startedAt": 1794417357058,          // 仅 active
+    "message": "..."                     // 成功/超时/失败的原因
   },
   "diagnostics": "插件: ...\nbuild: ...\n..."
 }
 ```
+
+**`pool.accounts[]` 里没有 `token` 字段。** 实测响应体 2248 字节、不含 `eyJ`、不含 `"token"` 键 —— 这一条有单测与冒烟双重断言（`smoke-pool.mjs` 第 8 段）。
 
 ### 2.3 字段规则
 
@@ -293,6 +338,10 @@ GET /plugins/dsh-raccoon-web/status
 | `quota` 缺值给 `null` 不给 `0` | `0`（真没积分）与"不知道"必须能区分 |
 | `desktopAuth.found: false` 时给 `reason` | 用户要知道是"没装客户端"还是"文件坏了" |
 | `build` 必须存在 | 用来判断浏览器加载的是不是新版本 |
+| `login.mode` 只在两个扫码入口并存时有意义 | 池区与登录区共用一个 `LoginFlow`，前端靠它认领"这张码是不是我的"（§6.6 / ADR-0012） |
+| `login.lastPoll` 只在 `pending`/`logging` 给 | `ready` 之后留着会让人以为还在轮询 |
+| `pool.accounts[]` 永不含 `token` | 这个端点会被前端每 20 秒拉一次，进浏览器上下文的凭据等于泄漏 |
+| `browser.url` 里没有 `code` | `code` 只在回调那一跳出现，服务端不存、status 不给 |
 
 ### 2.4 为什么要有 `build`
 
@@ -336,23 +385,23 @@ UI 拿到 `status.build` 与自己的 `BUILD` 常量对比，不一致就在标�
 
 ## 4. 诊断块
 
-### 4.1 十四行（2026-11-11 真宿主 `GET /plugins/dsh-raccoon-web/status` 的真实输出）
+### 4.1 十四行（2026-11-12 真宿主 `GET /plugins/dsh-raccoon-web/status` 的真实输出）
 
 ```
-插件: dsh-raccoon-web 0.1.0
-build: 2026-11-11T23:05
+插件: dsh-raccoon-web 0.2.1
+build: 2026-11-12T01:35
 平台: win32 / node v24.21.0
 登录: ready (access_token)
 来源: 官方客户端凭据
 桌面端: 已读到 (C:\Users\Administrator\.office-raccoon\agent\config\auth.json)
-账号: pu-01a19
+账号: pu-01a1c
 provider: published
 目录: 6 个模型
-余额: 383
+余额: 9300
 上下文上限: 1000000
 思考: 开
 扫码协议: Web auth（官方桌面端同款）
-号池: 关（池空）
+号池: 关（2 个账号，未启用自动换号）
 ```
 
 第 14 行「号池」由 `status.ts` 的 `poolLine()` 生成，五种形态：

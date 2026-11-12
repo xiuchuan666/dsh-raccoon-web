@@ -65,6 +65,16 @@ export interface StatusLogin {
    * 否则一边点按钮会让另一边的二维码显示成"还在等你扫"。
    */
   mode?: "primary" | "pool";
+  /**
+   * 服务端上一次轮询回的原始状态（`pending` / `logging` / `canceled` /
+   * `expired` / `success` / `error:xxx`）。
+   *
+   * 排障专用：用户说"扫了没反应"时，这一条能立刻区分"服务端根本没认这张码"
+   * 与"服务端回了我们没见过的状态"。只在这一轮还在等（pending/logging）时给。
+   */
+  lastPoll?: string;
+  /** `lastPoll` 的时刻（epoch ms）。 */
+  lastPollAt?: number;
   /** JWT 的 sub 前 8 位。够区分账号，不够反推。 */
   principal?: string;
   /** token 类型。 */
@@ -72,7 +82,7 @@ export interface StatusLogin {
   /** epoch ms。 */
   expiresAt?: number;
   /** 当前这批 token 从哪来。 */
-  source?: "qr" | "desktop";
+  source?: "qr" | "desktop" | "browser";
 }
 
 /**
@@ -120,7 +130,7 @@ export interface StatusPoolAccount {
    */
   device: string;
   /** 这个号从哪来。 */
-  source: "qr" | "desktop";
+  source: "qr" | "desktop" | "browser";
   /** 最近一次测量的结论。没测过就是 undefined。 */
   measure?: {
     state: PoolState;
@@ -151,7 +161,31 @@ export interface StatusPool {
   note?: string;
 }
 
-/** 完整快照。 */
+/**
+ * 浏览器 loopback 登录的当前状态（ADR-0012）。
+ *
+ * 扫码那条路 2026-11-12 起在服务端侧已经断了（`/login/mp` 恒 404），
+ * 所以"加一个号"的主路线改成：DSH 在本机起一次性回调服务 → 用户在浏览器里
+ * 正常登录（手机号/微信都行）→ 浏览器重定向回来 → 我们拿 `code` 换 token。
+ *
+ * 这个块只描述"有没有一轮在等"，**不含 code、不含 token**。
+ */
+export interface StatusBrowser {
+  /** 有一轮在等回调。 */
+  active: boolean;
+  /** 给用户在浏览器里打开的地址。`active` 为 false 时不给。 */
+  url?: string;
+  /** 本机回调端口。 */
+  port?: number;
+  /** epoch ms。 */
+  startedAt?: number;
+  /** 上一轮的结论（成功/失败/超时），给人看。 */
+  message?: string;
+}
+
+/**
+ * 完整快照。
+ */
 export interface StatusSnapshot {
   /** client.js 的构建标记。诊断时第一眼看的东西。 */
   build: string;
@@ -182,6 +216,8 @@ export interface StatusSnapshot {
   desktopAuth: StatusDesktopAuth;
   /** 号池状态。**不含 token。** */
   pool: StatusPool;
+  /** 浏览器登录的当前状态。**不含 code、不含 token。** */
+  browser: StatusBrowser;
   /** 诊断块里可复制的纯文本。**不含 token。** */
   diagnostics: string;
 }
@@ -207,7 +243,7 @@ export function buildDiagnostics(input: {
     `build: ${input.build}`,
     `平台: ${input.platform ?? process.platform} / node ${input.node ?? process.version}`,
     `登录: ${snapshot.login.phase}${snapshot.login.kind === undefined ? "" : ` (${snapshot.login.kind})`}`,
-    `来源: ${snapshot.login.source === undefined ? "-" : snapshot.login.source === "desktop" ? "官方客户端凭据" : "扫码"}`,
+    `来源: ${sourceLine(snapshot.login.source)}`,
     `桌面端: ${snapshot.desktopAuth.found ? `已读到 (${snapshot.desktopAuth.path ?? "-"})` : `未读到 (${snapshot.desktopAuth.reason ?? "-"})`}`,
     `账号: ${snapshot.login.principal ?? "-"}`,
     `provider: ${snapshot.publish}`,
@@ -219,6 +255,14 @@ export function buildDiagnostics(input: {
     `号池: ${poolLine(snapshot.pool)}`,
   ];
   return lines.join("\n");
+}
+
+/** 诊断块里的来源一行。三种来源各自说清，别把浏览器登录也说成"扫码"。 */
+function sourceLine(source: "qr" | "desktop" | "browser" | undefined): string {
+  if (source === undefined) return "-";
+  if (source === "desktop") return "官方客户端凭据";
+  if (source === "browser") return "浏览器登录";
+  return "扫码";
 }
 
 /** 诊断块里的号池一行。 */

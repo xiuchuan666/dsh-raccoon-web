@@ -11,7 +11,7 @@
 
 ```
 packages/dsh-raccoon-web/                  实测 2026-11-11（逐文件数行）
-├── src/                                    7,370 行 / 28 文件
+├── src/                                    8,390 行 / 29 文件
 │   ├── build.ts                              23
 │   ├── index.ts                             125   插件入口
 │   ├── types/
@@ -33,9 +33,9 @@ packages/dsh-raccoon-web/                  实测 2026-11-11（逐文件数行�
 │   │   ├── adapter.ts                       298
 │   │   └── fallback-roster.ts                68
 │   └── host/                              3,735
-│       ├── index.ts                       1,280   ← 最大单文件
-│       ├── pool.ts                          439
-│       ├── login-flow.ts                    448
+│       ├── index.ts                       1,591   ← 最大单文件
+│       ├── pool.ts                          478
+│       ├── login-flow.ts                    571
 │       ├── routes.ts                        240
 │       ├── publish.ts                       244
 │       ├── store.ts                         230
@@ -44,8 +44,8 @@ packages/dsh-raccoon-web/                  实测 2026-11-11（逐文件数行�
 │       ├── solid-png.ts                     126
 │       ├── log.ts                           106
 │       └── cache.ts                          75
-├── client.js                              1,525   手写 classic script
-└── test/                                  2,644 行 / 11 文件
+├── client.js                              1,626   手写 classic script
+└── test/                                  3,168 行 / 12 文件
     ├── helpers.ts                           170
     ├── qr.test.ts                           166
     ├── iam.test.ts                          297
@@ -422,7 +422,7 @@ Qwen3.8-Flash         —     x0.15   262144 / 32768
 
 ## 4. `host/` —— 唯一接触 `ctx` 的层
 
-### index.ts（1,280 行，最大的单文件）
+### index.ts（1,591 行，最大的单文件）
 
 `class RaccoonHost`。一眼看清的字段：
 
@@ -450,7 +450,7 @@ poolActiveId: string | undefined;       // 当前"粘住"的号
 | `bootstrap()` | 读 token → 读 probes → 读号池 → `resolveToken()` → `syncPublisher()` → 有 token 则 `refreshCatalog()` + `refreshQuota()` + 再 sync |
 | `resolveToken(reason)` | 按 `authSource` 决定用桌面端还是扫码；过期/读不到时的降级与文案 |
 | `mount(webServer)` | 挂 status / action 两条路由，返回 disposer |
-| `runAction(action, body)` | 全部 action 的分派：16 个 `case`、14 个 action 名（`set-setting` 与 `set-enabled` 同体） |
+| `runAction(action, body)` | 全部 action 的分派：**18 个 `case`、16 个 action 名**（`set-setting` 与 `set-enabled` 同体） |
 | `snapshot()` | 组装 `StatusSnapshot`（含 14 行诊断） |
 | `syncPublisher()` | 名册每次重建（设备身份是名册级属性），签名没变时 publisher 自己跳过 |
 | `statusModels()` | 按 `contextCap` 截断后给 UI 的模型列表 |
@@ -468,7 +468,7 @@ poolActiveId: string | undefined;       // 当前"粘住"的号
 
 **预热判据必须是 `activeToken()` 而不是 `this.token`**：装过官方客户端、只用「导入客户端账号」加池、从没扫码的用户，`this.token` 是 `undefined` 而号池里明明有好号。四处判据（`bootstrap()` 预热 / `refresh-catalog` / `refreshAuth` / `probeVision`）在 2026-11-11 之前都用错了。
 
-### pool.ts（439 行）
+### pool.ts（478 行）
 
 号池的**纯逻辑**，不碰 `ctx`、不碰网络（只碰文件）。分成四块：
 
@@ -499,7 +499,7 @@ ACTION_PATH = "/plugins/dsh-raccoon-web/action"     （POST only，?action=xxx�
 
 `isLoopback()` 的实现要点：`[` 开头取方括号内比对 `"::1"`；否则取 `:` 前比对 `"127.0.0.1"` / `"localhost"`；**Host 缺失返回 false**。
 
-### login-flow.ts（448 行）
+### login-flow.ts（571 行）
 
 ```ts
 type LoginPhase = "none" | "pending" | "logging" | "ready" | "expired" | "error";
@@ -636,12 +636,12 @@ export function apply(ctx: PluginContext): void;
 
 ---
 
-## 6. `client.js`（1,525 行，手写）
+## 6. `client.js`（1,626 行，手写）
 
 ```
 IIFE
 ├── 常量（BUNDLE_NAME / NAMESPACE / STATUS_PATH / ACTION_PATH / BUILD / PROVIDER_ID / 轮询间隔）
-├── 文案字典 zh / en（各 117 键 = 88 非 pool + 29 pool，全内联，不用 locale/*.json）
+├── 文案字典 zh / en（各 124 键 = 89 非 pool + 35 pool，全内联，不用 locale/*.json）
 ├── 样式常量（15 组，全部 var(--dsh-*, fallback) 双写）
 ├── 工具（tFactory / points / compact / clockOf / messageOf）
 ├── 共享 store（listeners / snapshot / lastError / timer / inflight / nextDelay / load / subscribe）
@@ -659,18 +659,18 @@ IIFE
 
 ## 7. 文件大小预算与现状
 
-**实测（2026-11-11，逐文件数行）**：`src/` 合计 **7,370 行** / 28 个文件；`test/` 11 个文件合计 **2,644 行**；`client.js` **1,525 行**。
+**实测（2026-11-12，逐文件数行）**：`src/` 合计 **8,390 行** / 29 个文件（新增 `protocol/loopback.ts` 405 行）；`test/` 12 个文件合计 **3,168 行**；`client.js` **1,626 行**。
 
 | 文件 | 预算 | 现状 | 备注 |
 | --- | --- | --- | --- |
 | `src/index.ts` | ≤120 | 125 | 略超，可接受 |
 | `protocol/qr.ts` | ≤500 | 484 | 编码器本身就是长 |
 | `protocol/chat.ts` | ≤250 | **505** | **超标**，帧解析 + thinking + stream 三块可以拆（但拆了会增加理解成本，暂不动） |
-| `host/index.ts` | ≤400 | **1,280** | **严重超标**，`runAction` 的 16 个 case（14 个 action 名 + `set-setting`/`set-enabled` 两条同体分支）可以拆成 `host/actions.ts` |
-| `host/pool.ts` | ≤300 | **439** | 超标，排序 + 分类 + 落盘三块可以拆 |
+| `host/index.ts` | ≤400 | **1,591** | **严重超标**，`runAction` 的 18 个 case（16 个 action 名 + `set-setting`/`set-enabled` 两条同体分支）可以拆成 `host/actions.ts` |
+| `host/pool.ts` | ≤300 | **478** | 超标，排序 + 分类 + 落盘三块可以拆 |
 | `host/login-flow.ts` | ≤300 | **425** | 超标，两套扫码协议的状态机挤在一个类里 |
 | `host/routes.ts` | ≤200 | 237 | 略超 |
-| `client.js` | ≤800 | **1,525** | **严重超标**，但 classic script 拆文件要靠额外的 loader，不划算 |
+| `client.js` | ≤800 | **1,626** | **严重超标**，但 classic script 拆文件要靠额外的 loader，不划算 |
 
 **不强行拆的理由**：`chat.ts` 与 `host/index.ts` 的超标都是"同一件事的连续逻辑"，拆开会让"改一个行为要跳三个文件"。等真正需要复用（比如第二个协议）再拆。
 

@@ -774,6 +774,70 @@ asar 内 SDK CHANGELOG 原文（GBK 乱码但可辨）：
 
 ---
 
+## E-040 · `/login/mp` 页面已 404（扫码链路服务端侧已断），官方换账号改走 `/authorize` + 本机 loopback（2026-11-12 实测）
+
+### 现象
+
+用户 m07683：账号池点「扫码添加」→ 微信扫码 → 手机上点「确认登录 Web/PC」→ 手机显示**「二维码已过期或已被使用，请在 Web/PC 端刷新二维码后重新扫码。」**，插件侧 `login.lastPoll` 一直是 `pending`，永远收不到 `success`。
+
+### 取证一：`/login/mp` 这个路由不存在
+
+| 请求 | UA | 结果 |
+| --- | --- | --- |
+| `GET /login/mp?code=<45字符>&appname=小浣熊官网` | 微信 iPhone `MicroMessenger/8.0.49` | **404 / 9723 字节** `__next_error__` |
+| 同上 | 微信 Windows | 404 |
+| 同上 | Chrome 131 | 404 |
+| 同上 | `curl/8.0` | 404 |
+| 同上 | 无 UA | 404 |
+| 同上 + `x-requested-with: com.tencent.mm` + `referer: https://servicewechat.com/` + 完整 `sec-fetch-*` | 微信 iPhone | 404 |
+| 同上 + `_rsc=1` + `accept: text/x-component` | — | **200 / 5566 字节 RSC 流**，内容含 `notFound:[[["$","title",null,{"children":"404: This page could not be found."}]]]` |
+| `GET /login/mp/`（尾斜杠） | — | 308 |
+| `GET /login/mp/<code>` | — | 404 |
+| `GET /login/mp`（无参数） | — | 404 |
+| `GET /login` | — | **200 / 44843 字节**，标题「登录账号 \| 商汤小浣熊」 |
+
+RSC 流里的 `notFound` 是 Next.js 的 404 表示 —— **坐实是路由不存在，不是鉴权、不是 UA 白名单、不是缺归因**。
+
+### 取证二：轮询端点对任何输入都恒 pending
+
+`POST /api/web/auth/v1/login_with_qrcode_code` 对 7 种 body **全部 `200 {"code":0,"message":"success","data":{"status":"pending"}}`**：
+
+正常 45 字符 code / `registration_attribution:""` / `registration_attribution:"test"` / 时间戳取 1 小时前 / 时间戳取 1 小时后 / `qrcode_code:"abc"`（格式非法）/ **`{}`（完全没有字段）**。
+
+响应头只有 `set-cookie: INGRESSCOOKIE=...`、`x-raccoon-request-id`、`server-timing: inner; dur=3` —— **没有任何"码未注册"的信号**。
+
+> 结论：微信端那句"已过期或已被使用"是**服务端对一张它根本不认识的 code 的默认回复**。我们把 UA 与 `registration_attribution` 补齐（见 `web-auth.ts` 的 `WEB_POLL_UA` / `WEB_ATTRIBUTION`）后行为**无任何变化** —— 缺的从来不是请求头。
+
+### 取证三：官方换账号走的是另一条路
+
+`app.asar/build/electron/main/client/account/webLogin.js`（12791 字节）：
+- `desktopLoginUrl()` = `new URL('/authorize', base)` + `login_source=desktop` + `appname=${enterpriseName('zh')}客户端`。
+- `start(guard, mode)`：`mode==='loopback'` 或 `preferLoopback` → `startLoopback()`。
+- `startLoopback()`：`desktop_callback=loopback` + `redirect=http://127.0.0.1:<port>/auth/callback` + `state=<32字节hex>`，本机起一次性 HTTP 服务。
+
+`app.asar/build/electron/main/client/account/webLoginLoopback.js`（7012 字节）的拒收条件（我们逐条照抄进 `parseCallback()`）：
+非 `/auth/callback?` 前缀 / `url.length>8192` / 带 `url.hash` / 参数名不在 `['code','state']` / `state` 或 `code` 出现次数 ≠ 1 / `!/^[a-f0-9]{64}$/` / `timingSafeEqual` 不等 / `code.trim()` 空 / `code.length>4096` / 含 `[\x00-\x1f\x7f]`。请求侧还要求 `GET`、`host` 相符、`remoteAddress==='127.0.0.1'`、`sec-fetch-dest` 空或 `document`。超时 300000ms。
+
+`app.asar/build/electron/main/account/desktopLogin.js`（6313 字节）：`exchangeDesktopLoginCode()` → `POST ${getAuthApiUrl()}/login_with_authorization_code`，body `{ authorization_code: code }`；`AUTHORIZATION_CODE_NOT_FOUND = 200035`；成功判据 `code === 0 && data.access_token`；**IAM token 不要求 `refresh_token`**（只有非 IAM token 才要求）。
+
+### 真网关实测（本轮）
+
+| 请求 | 结果 |
+| --- | --- |
+| `POST /api/web/auth/v1/login_with_authorization_code` body `{authorization_code:"fake"}` | **400 `{"code":200035,"message":"authorization_code_not_found_error","details":"authorization code not found"}`** |
+| 同上 body `{}` | 同上 400 / 200035 |
+| `GET /authorize?login_source=desktop&appname=商汤小浣熊客户端&desktop_callback=loopback&redirect=http://127.0.0.1:<PORT>/auth/callback&state=<64hex>` | **200 / 32175 字节**，`<title>客户端授权 \| 商汤小浣熊</title>`，正文含「授权 商汤小浣熊客户端」 |
+
+**`login_with_authorization_code` 真的在校验 code** —— 与 `login_with_qrcode_code` 的无状态完全不同。这是这条路可用的根本原因。
+
+### 对本项目的意义
+
+1. **扫码加号（`pool-add-start`）在服务端侧已死**，不是我们的 bug。保留它是因为 IAM 小程序码（`qrProtocol: "iam"`）走的是另一套命名空间（`POST /api/iam/v1/auth/mp/qrcode`），未受此影响。
+2. **`pool-add-browser` 成为加号主路线**：本机起一次性回调 → 用户在浏览器里正常登录（手机号 / 微信都行，由官方网页端自己处理风控与验证码）→ 浏览器重定向回 `127.0.0.1:<port>` → 我们拿 `code` 换 token。用户 m07715 描述的"先在浏览器里登录，再返回客户端"就是这条路。
+3. 实现见 `packages/dsh-raccoon-web/src/protocol/loopback.ts`（ADR-0012），单测 LB-1~LB-35，真宿主实测：`POST ?action=pool-add-browser` 返回 `browser.url`（`https://xiaohuanxiong.com/authorize?...&redirect=http%3A%2F%2F127.0.0.1%3A64023%2Fauth%2Fcallback&state=<64hex>`）+ `port: 64023`；错误 state → 400；错误路径 → 400；假 code 回调 → 502 且 status 里 `browser.message = "authorization_code_not_found_error"`。
+
+---
+
 ## 待补的实测
 
 | # | 内容 | 状态 |
@@ -788,5 +852,8 @@ asar 内 SDK CHANGELOG 原文（GBK 乱码但可辨）：
 | E-039 | 免费模型的真实倍率字段 | ✅ 已实测：`billing_effective_multiplier` |
 | E-018 | 图片：base64 vs URL | ✅ 已实测：**两种都支持**，裸 base64 会被当 URL |
 | E-019 | 413 的真实阈值 | ✅ 已实测：**约 3.0001 MiB，且返回 400 不是 413** |
+| E-040 | `/login/mp` 与官方换账号路径 | ✅ 已实测：`/login/mp` **恒 404**，官方走 `/authorize` + loopback（见上） |
 
 **已无待补项。** 下一批实测只在上游行为变化时才有意义（例如网关改了目录字段、改了体积上限、或真的撞到 200429 限流帧）。
+
+> **2026-11-12 追加**：E-040 是本表之外新增的一条 —— 它不是"待补"，是用户报障时查出来的上游行为变更（`/login/mp` 路由被下线）。这类"上游悄悄改掉一条路"的事实以后都应立即进这张表，而不是等有人报障。

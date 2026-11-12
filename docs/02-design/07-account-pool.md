@@ -314,24 +314,39 @@ export async function grantDaily(token: string, fetchImpl: typeof fetch = fetch)
 POST /plugins/dsh-raccoon-web/action?action=pool-checkin
 → {
     ok: true,
-    rows: [
-      { id, label, principal, before: 383, after: 383, result: "already" | "granted" | "error", message? },
+    pool: { … },
+    results: [
+      { id, result: "already" | "granted" | "error", message? },
       ...
     ]
   }
 ```
 
+**实现与设计稿的差异**：设计稿写的是 `rows` 且带 `label` / `principal` / `before` / `after`。
+实现里叫 `results`、只带 `{ id, result, message? }` —— `id` 已经能定位账号（前端有完整 `pool.accounts`），
+`before` / `after` 两个数字要额外打两次 `balance`，而签到之后本来就会统一刷新一次余额读数，
+再多打一轮纯属浪费。**这是有意的减法，不是漏做。**
+
 `result` 三值：
 
-| 值 | 条件 | UI 文案 |
+| 值 | 条件 | UI 文案（zh） |
 | --- | --- | --- |
-| `already` | `todayGranted(bills)` 命中，或 `grantDaily` 返回 `granted:false` | 今日已领 |
-| `granted` | `grantDaily` 返回 `granted:true` | 已领取 |
-| `error` | 抛错 | 错误原文（不折叠） |
+| `already` | `todayGranted(bills)` 命中，或 `grantDaily` 返回 `granted:false` | 今日已签 |
+| `granted` | `grantDaily` 返回 `granted:true` | 已签到 |
+| `error` | 抛错 | 签到失败 · 上游原文第一行 |
 
-**顺序**：先 `fetchBills` 判今日是否已领；已领直接标 `already`，**不发写请求**。再 `grantDaily`。最后 `fetchBalance` 取 `after`。
+**顺序**：先 `fetchBills` 判今日是否已领；已领直接标 `already`，**不发写请求**。再 `grantDaily`。
+领到之后顺手 `fetchBalance` 刷新这个号的 `poolQuota`（下次选号排序用）。
 
 **单个失败不中断。** 用 `for...of` + 每行 try/catch，不用 `Promise.all`（并发打 5 个号会更容易触发风控）。
+
+**失败要记测量状态。** 设计稿只把失败塞进 `results`，实现里额外走
+`classifyMeasure()` + `shouldPersistMeasure()`（`ACCOUNT_KINDS` 把 `RaccoonErrorKind` 映射到
+`MeasureInput.kind`，`INVALID_REQUEST` / `ABORTED` 不映射）：`AUTH` → `dead`、限流 → `limited`、
+超时/网络 → `flaky`、余额不足 → `empty`，HTTP 400 之类与账号无关的仍然不记。
+理由：签到是**用户主动**发起的、每天一次的动作，它拿到的失败信号比对话中途的 `onResponse`
+更可信 —— 凭据真的废了就该在卡片上显示「凭据失效」，而不是继续被选去服务。
+写盘走 `savePool()`（合并后整表写），失败不影响结果展示。
 
 **与 `poolEnabled` 无关。** 关着也能签。
 
@@ -339,16 +354,22 @@ POST /plugins/dsh-raccoon-web/action?action=pool-checkin
 
 ## 5. HTTP 动作清单（按 `runAction()` 实现回填）
 
-新增六个 action（全部 POST + loopback，走既有 `routes.ts` 的检查）：
+新增八个 action（全部 POST + loopback，走既有 `routes.ts` 的检查）：
 
 | action | body | 作用 |
 | --- | --- | --- |
-| `pool-add-start` | — | `loginFlow.start("pool")`；池模式**不写 `token.json`、不改主登录相位** |
+| `pool-add-start` | — | 扫码加号（备用路线）：`loginFlow.start("pool")`；池模式**不写 `token.json`、不改主登录相位** |
+| `pool-add-browser` | — | **浏览器 loopback 加号（主路线，ADR-0012）**：本机起一次性回调服务，返回 `browser.url` / `port`，后台等回调 |
+| `pool-add-browser-cancel` | — | 收掉在途的 loopback 服务（用户点了「取消等待」） |
 | `pool-import-desktop` | — | 把 `readDesktopAuth()` 读到的凭据加进池（只读，不复制文件） |
 | `pool-toggle` | `{ id, enabled }` | 勾选/取消勾选；写盘失败**回滚内存** |
 | `pool-remove` | `{ id }` | 删一行，同时 `poolQuota.delete(id)` |
 | `pool-checkin` | — | 一键签到，遍历**全部**账号（含未启用） |
 | `pool-test` | `{ id }` | 打一次 `model_catalog` 验证凭据，写回 measure |
+
+**为什么加号有两条路，且 loopback 是主路线。** 2026-11-12 实测 `GET /login/mp?code=...` 对任何 UA 都返回 404（E-040），Web auth 扫码链路在服务端侧已经断了 —— 用户微信扫完点确认，手机上看到的是「二维码已过期或已被使用」，而 `login_with_qrcode_code` 对任何 body 都恒回 `pending`，我们**没有任何信号**能分辨"码有效但没人扫"与"码根本不存在"。官方桌面端自己换账号也不用扫码：它打开浏览器到 `/authorize`，用户在浏览器里正常登录，完成后重定向到客户端在本机起的一次性回调服务。那条路的两个端点都实测可用（`/authorize` → 200；`login_with_authorization_code` 对假 code → `400 code=200035`，真的在校验）。详见 ADR-0012 与 `protocol/loopback.ts` 的文件头。
+
+**扫码那条不删。** IAM 小程序码（`qrProtocol: "iam"`）走的是另一套命名空间（`POST /api/iam/v1/auth/mp/qrcode`），未受 `/login/mp` 下线影响；而且 `/authorize` 与 `/login/mp` 是同一家公司同一批代码，没有理由认为它不会同样被下线。
 
 **`pool-checkin` 不接收 `ids`。** 设计稿里写过 `{ ids? }`，实现时去掉了：签到是"把所有的账号都一键签到了"（用户原话），传部分 id 只会让 UI 多一层选择，而且失败也要逐个回报。
 
@@ -436,8 +457,14 @@ export interface StatusPool {
   ☐ 3f0a91cc   pu-02b3…                          限流中
      设备 91aa02f1 · 冷却到 21:10                      [测试] [移除]
 
-  [扫码添加]  [导入客户端账号]  [一键签到]
+  [浏览器登录]  [扫码添加]  [导入客户端账号]  [一键签到]
   新加进来的账号默认不启用，勾上才会被拿去发请求。
+
+  ┌──────────────────────────────────────────────┐
+  │ 正在等待浏览器完成登录（最多 5 分钟）。          │
+  │ 在浏览器里用手机号或微信登录，完成后浏览器会跳回本机。 │
+  │ [打开授权页]  [取消等待]                        │
+  └──────────────────────────────────────────────┘
 ```
 
 ### 7.3 交互契约
@@ -448,12 +475,14 @@ export interface StatusPool {
 - **二维码跟宿主状态走，不用点击那一刻的快照**：`pendingQr` 只在 `login.phase` 是 `pending`/`logging` 时渲染，相位一变自动收起。不复用主登录段的相位，因为那是"当前账号"的入口。
 - **必须用 `login.mode === 'pool'` 认领二维码。** 两个扫码入口（登录区 / 池区）共用一个 `LoginFlow`，`start(mode)` 会先 `cancel()` 再取码 —— 只判 `phase === 'pending'` 会让池区把主登录的码当成自己的显示出来，用户扫完 token 写进 `token.json` 而池里没多号。`mode` 由 `LoginSnapshot.mode` → `loginBlock()` → `StatusLogin.mode` 一路透传，`cancel()` / `markReady()` / `markDead()` / `complete()` 的池分支都把它收回 `"primary"`。反过来登录区在 `mode === 'pool'` 时不显示二维码，改显示 `loginPoolBusy`（"二维码在下面的「账号池」区域"）。详见 `04-ui-surfaces.md` §6.6。
 - **当前使用**标记来自 `pool.activeId`，**不是**用户手动选的。
+- **浏览器登录的状态从 `status.browser` 读，不在界面里自己记。** 用户可能在浏览器里花一两分钟（输手机号、收验证码），期间会切走设置卡再切回来；自己记的 `pending` 就丢了。宿主那一份 `Host.browserLogin` 才是真相，界面只是投影。`browser.active === false` 且 `browser.message` 有值时，把那句话显示出来（成功 / 超时 / `authorization_code_not_found_error` 都在里面）。
+- **同一时刻只允许一轮 loopback。** `pool-add-browser` 会先 `closeBrowserLogin("已重新发起浏览器登录。")` 再起新的 —— 两个回调服务同时等，用户不知道哪个页面在等，而结果都写进同一个池。
 
-### 7.4 文案键（zh / en 各 29 个，实测 `grep` 计数）
+### 7.4 文案键（zh / en 各 35 个，实测 `grep` 计数）
 
-`poolTitle` / `poolHint` / `poolEnabledLabel` / `poolEnabledHint` / `poolEmpty` / `poolCount` / `poolAddQr` / `poolAddDesktop` / `poolAddHint` / `poolImportOk` / `poolCheckin` / `poolCheckinBusy` / `poolCheckinAlready` / `poolCheckinGranted` / `poolCheckinFailed` / `poolTest` / `poolTesting` / `poolRemove` / `poolRemoveConfirm` / `poolActive` / `poolDevice` / `poolExpires` / `poolCoolUntil` / `poolStateUnknown` / `poolStateOk` / `poolStateLimited` / `poolStateEmpty` / `poolStateDead` / `poolStateFlaky`
+`poolTitle` / `poolHint` / `poolEnabledLabel` / `poolEnabledHint` / `poolEmpty` / `poolCount` / `poolAddQr` / `poolAddDesktop` / `poolAddHint` / `poolImportOk` / `poolCheckin` / `poolCheckinBusy` / `poolCheckinAlready` / `poolCheckinGranted` / `poolCheckinFailed` / `poolTest` / `poolTesting` / `poolRemove` / `poolRemoveConfirm` / `poolActive` / `poolDevice` / `poolExpires` / `poolCoolUntil` / `poolStateUnknown` / `poolStateOk` / `poolStateLimited` / `poolStateEmpty` / `poolStateDead` / `poolStateFlaky` / `poolAddBrowser` / `poolAddBrowserBusy` / `poolBrowserHint` / `poolBrowserWaiting` / `poolBrowserOpen` / `poolBrowserCancel`
 
-（比设计稿的 18 个多，因为签到结果要分三态、账号状态要分六态、还要两段式删除的"取消"。**设计稿里那四个 `poolError` / `poolNeedId` / `poolRemoved` / `poolToggled` 没有落地** —— 错误与结果直接显示宿主返回的 `error` / `message`，不再包一层自己的文案，少一层翻译就少一处对不上。）
+（比设计稿的 18 个多，因为签到结果要分三态、账号状态要分六态、还要两段式删除的"取消"，2026-11-12 又加了六条浏览器登录的（ADR-0012）。**设计稿里那四个 `poolError` / `poolNeedId` / `poolRemoved` / `poolToggled` 没有落地** —— 错误与结果直接显示宿主返回的 `error` / `message`，不再包一层自己的文案，少一层翻译就少一处对不上。同理 `poolBrowserExpired` 也删掉了：超时的文案由宿主 `browser.message` 给，界面只负责显示。）
 
 ---
 
@@ -471,15 +500,17 @@ export interface StatusPool {
 | `src/host/login-flow.ts` | `LoginMode = "primary" \| "pool"`；`start(mode)`；`onReady(token, mode)`；池模式不写 `token.json` |
 | `src/host/publish.ts` | `PublishInput.deviceId?`；`PublishAccountResolver`；`sync()` 第三参；指纹加 `dev:<deviceId>` |
 | `src/host/status.ts` | `StatusPool` / `StatusPoolAccount` / `poolLine()`；诊断第 14 行 |
-| `src/host/index.ts` | 三个私有字段 + 六个 action + `addPoolAccount()` / `resolvePoolAccount()` / `activeToken()` / `activeDeviceId()` / `recordMeasure()` / `poolSnapshot()`；`syncPublisher()` 重写成每次重建名册；`sessionIdForPublish()` 按池成员取 principal |
+| `src/host/index.ts` | 三个私有字段 + 八个 action + `addPoolAccount()` / `resolvePoolAccount()` / `activeToken()` / `activeDeviceId()` / `recordMeasure()` / `poolSnapshot()`；`syncPublisher()` 重写成每次重建名册；`sessionIdForPublish()` 按池成员取 principal |
 | `src/provider/roster.ts` | `RosterOptions.deviceId`；`toDescriptor()` 注入 `x-client-device-id` |
 | `src/provider/api.ts` | `LooseOptions.onResponse`；`createRaccoonApi(effortOf, onStatus)` |
 | `src/provider/adapter.ts` | `AdapterOptions.resolveAccount?` / `onResponse?`；`resolveKey()` 统一取 key |
-| `client.js` | `PoolSection`（约 150 行）+ 29×2 个文案键 + `loginPoolBusy`；`CreditPillGate` 改成总是显示 |
-| `test/host.test.ts` | ST-4 键集合加 `poolEnabled`；ST-25 改 14 行；新增 ST-25b / ST-25c |
-| `test/pool.test.ts` | **新文件**（PO-1 ~ PO-40）。纯函数 11 个 suite：id 派生 / 设备身份 / 五条排序 / 冷却 / 分类 / 北京零点 / 摘要 / upsert / **`shouldPersistMeasure` 去抖** / 落盘往返 |
+| `client.js` | `PoolSection`（约 200 行）+ 35×2 个文案键 + `loginPoolBusy` + `loginLastPoll`；`CreditPillGate` 改成总是显示；浏览器登录块（`data-raccoon-browser`） |
+| `src/protocol/loopback.ts` | **新文件**（405 行，ADR-0012）。`authorizeUrl()` / `newState()` / `parseCallback()` / `startLoopback()` / `exchangeCode()` + 结果页 |
+| `test/loopback.test.ts` | **新文件**（LB-1 ~ LB-35）。`authorizeUrl` 参数顺序 / `newState` 形状 / `parseCallback` 的 14 条拒收 reason / `exchangeCode` 六种分支 / `startLoopback` 真起服务打自己回调（一次性、403、400、502、超时、abort、只绑 127.0.0.1） |
+| `test/host.test.ts` | ST-4 键集合加 `poolEnabled`；ST-25 改 14 行；新增 ST-25b / ST-25c / ST-18b / ST-18c / ST-28 / ST-29 / ST-30 |
+| `test/pool.test.ts` | **新文件**（PO-1 ~ PO-43）。纯函数 12 个 suite：id 派生 / 设备身份 / 五条排序 / 冷却 / 分类 / 北京零点 / 摘要 / upsert / **`shouldPersistMeasure` 去抖** / **`mergePools`** / 落盘往返 |
 | `scripts/smoke-client-apply.mjs` | **新脚本**。`node:vm` 离线跑 `apply`，`--twice` 复现重复加载 |
-| `scripts/smoke-pool.mjs` | **新脚本**。真 `RaccoonHost` + 假网关跑六个 action（**12 段 56 条断言**），不碰网络、不碰真实 `~/.dsh` |
+| `scripts/smoke-pool.mjs` | **新脚本**。真 `RaccoonHost` + 假网关跑十三个 action（**13 段 82 条断言**），不碰网络、不碰真实 `~/.dsh` |
 | `scripts/revive.mjs` | patch 被手工删掉后的重建路径（靠 `link.mjs` 补回 insert） |
 
 **设计稿里写过、后来补上的两项**：`test/pool.test.ts` 与 `scripts/smoke-pool.mjs`。补的时候发现两件事，都值得记下来：
@@ -492,7 +523,7 @@ export interface StatusPool {
 ## 9. 冒烟与验证（实际跑过的）
 
 1. `node node_modules/typescript/bin/tsc --noEmit -p packages/dsh-raccoon-web` → exit 0。
-2. `node --test --experimental-strip-types --import ./scripts/test-resolve-register.mjs packages/dsh-raccoon-web/test/*.test.ts` → **220 tests / 45 suites / 220 pass / 0 fail**（其中 `pool.test.ts` 40 条，`chat.test.ts` 51 条）。
+2. `node --test --experimental-strip-types --import ./scripts/test-resolve-register.mjs packages/dsh-raccoon-web/test/*.test.ts` → **263 tests / 52 suites / 263 pass / 0 fail**（其中 `pool.test.ts` 43 条、`chat.test.ts` 51 条、`loopback.test.ts` 35 条、`host.test.ts` 36 条）。
 3. `node scripts/smoke-client-apply.mjs` → 3 个 slot；`--twice` 也 3 个，只出一条 `locale registration skipped`。
 4. `node scripts/smoke-host.mjs` → ✓ 冒烟全绿；`node scripts/smoke-provider.mjs` → ✓ provider 冒烟全绿。
 5. `node scripts/smoke-pool.mjs` → **41 条断言全绿**（10 段）。它验的六件事：
@@ -502,22 +533,31 @@ export interface StatusPool {
    - 勾选 B → `activeId` 变 B、`publish` 仍 `published`、**触发一次重新注册**（`2 → 3`）、旧 registration 已释放、`handle.replace` 零调用。
    - 再勾选 A → B 的 `daily` 更高（500 vs 100）所以**仍用 B**（第二层排序真的生效，不来回跳）；关掉 B → 退回 A。
    - `pool-checkin` 三行结果（含未启用的号）、A 是 `already`、B 是 `granted`、**写请求只打到 B 与 dead 号，没打到 A**；`accounts.json` 落盘 3 条、`token.json` 没被池模式写过、`status` 里既没有 token 原文也没有 deviceId 全文。
-6. 真宿主（端口 52091，build `2026-11-11T23:05`）：
+6. 真宿主（端口 52091，build `2026-11-12T01:20`）：
    - `action=pool-import-desktop` → `total:1`、`enabled:false`、`device:"c9012c1d"`（修完 `raccoon-` bug 之后）
    - `action=pool-test` → `healthy:true`、`measure:{state:"ok",note:"正常"}`
    - `action=pool-toggle {enabled:true}` → `enabledCount:1`
    - `set-setting {key:"poolEnabled",value:true}` → `activeId` 非空、`accounts[0].active:true`、`publish:"published"`
    - 诊断末行 → `号池: 开（1 个启用，当前 7b86c892）`
+   - **`action=pool-add-browser`**（ADR-0012）→ `browser.active:true`、`browser.url` = `https://xiaohuanxiong.com/authorize?login_source=desktop&appname=…&desktop_callback=loopback&redirect=http%3A%2F%2F127.0.0.1%3A64023%2Fauth%2Fcallback&state=<64hex>`、`browser.port:64023`
+   - 回调服务的三条护栏实测：错 state → **400**、错路径 → **400**、合法 state + 假 code → **502** 且 `status.browser.message = "authorization_code_not_found_error"`（真的打到了 `login_with_authorization_code`）
 
-`scripts/smoke-pool.mjs` 现在是 **12 段 56 条断言**（2026-11-11 终值），其中第 6.5 段与第 6.6 段是两条**回归护栏**，写法上有讲究：
+`scripts/smoke-pool.mjs` 现在是 **13 段 82 条断言**（2026-11-12 终值），其中第 6.5 段与第 6.6 段是两条**回归护栏**，写法上有讲究：
 
 - **6.5 只读路径稳定**：连查五次 `status`，报的当前号必须一致，且 `pool/pick` 至多 1 条。造出"第一次选号"的办法是"先用 host action 关池（会清 `poolActiveId`）→ 再绕过 action 直接 `settings.update({poolEnabled:true})` 打开"，否则断言恒真。
 - **6.6 池成员凭据坏了不能判死主登录**：靠一个 `killA` 开关让假网关对 A 回 401，而不是用池里那个 DEAD 号 —— DEAD 在第 3 段已被 `pool-test` 标成 `dead`、`until = MAX_SAFE_INTEGER`，`sortForUse()` 不会再选它，"池成员在服务但凭据坏了"这个状态根本造不出来。正反两面都测：池在服务时 `phase` 必须仍 `ready`；关掉池后桌面端凭据失效必须 `expired`，且文案是"打开官方客户端"而不是"重新扫码"。
 
-**没跑过的三件**（写在这里免得下次以为验过）：
+- **签到失败影响选号**（2026-11-12 补）：假网关的 `/login/points/grant` 对 `DEAD` 回 401 后，
+  断言 `DEAD` 那一行是 `error`、`accounts.json` 里它的 `measure.state` 变成 `dead`、
+  且写盘没有抹掉别的号（合并后仍 3 条）。没有这条护栏时，"签到失败只进 `results` 不动 `measure`"
+  这个缺口在冒烟里完全看不出来 —— 它会一路绿到用户面前。
+- **9. 浏览器 loopback 加号**（2026-11-12 新增，ADR-0012）：真起本机服务 → 断言 URL 是 `/authorize` 且带 `desktop_callback=loopback`、`redirect` 指向 `127.0.0.1:<port>/auth/callback`、`state` 是 64 hex；错 state → **400** 且**一次都不打换码端点**；假 code → **502**、页面里有服务端文案、`browser` 收摊、**池没被污染**；合法 code → **200**、池里多一个 `source:"browser"` 的号、默认 `enabled:false`、有独立 8 位 `device`、`active:false`；取消与重复取消各一条。
+
+**没跑过的四件**（写在这里免得下次以为验过）：
 
 - `action=pool-checkin` 打真实网关的"真的领到"分支（当日已领，只验到 `granted:false`）。`smoke-pool.mjs` 里的 `granted:true` 是假网关给的，不算实测。
-- `action=pool-add-start` 的扫码加号（要用户手机）。
+- **`action=pool-add-browser` 的"真的登进去"分支** —— 需要用户在浏览器里真的登录一次。验过的是：起服务、URL 形状、三条拒收判据、假 code 走完 `login_with_authorization_code` 拿到 `200035`。**"用户登录成功后回调带回真 code、换到真 token、进池"这一段没有人跑过。**
+- `action=pool-add-start` 的扫码加号（要用户手机；而且 `/login/mp` 已 404，这条路只在 `qrProtocol: "iam"` 下才有意义）。
 - `action=pool-remove` 在真宿主上（`smoke-pool.mjs` 里跑过，但那是假网关）。
 
 ---

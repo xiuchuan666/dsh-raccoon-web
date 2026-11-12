@@ -54,13 +54,62 @@ export interface WebQrSession {
 export interface WebQrPoll {
   status: "pending" | "logging" | "success" | "canceled" | "expired" | "error";
   accessToken?: string;
+  /**
+   * 服务端一并给的 refresh token。
+   *
+   * **只做诊断/断言用，绝不落盘**（ADR-0011）：这套凭据的 refresh 会 rotate，
+   * 一 rotate 就把官方客户端踢下线，而且我们看不到"用户被踢"。
+   */
+  refreshToken?: string;
   expiresIn?: number;
   pollInterval?: number;
   message?: string;
+  /**
+   * 服务端原样回的 `data.status`。
+   *
+   * 为什么要留一份原文：我们把不认识的 status 一律当 `pending`（上游加新状态
+   * 不该让用户登录失败），可这样一来"上游回了 `blocked`"与"上游回了
+   * `pending`"在 `status` 字段上完全一样，排障时无从分辨。留原文就能看出来。
+   */
+  rawStatus?: string;
 }
 
 /** 官方客户端的 code 形状：13 位毫秒时间戳 + 32 位小写 hex。 */
 const CODE_RE = /^\d{13}[a-f0-9]{32}$/;
+
+/**
+ * 轮询时用的 UA。
+ *
+ * 官方网页端（`23127.*.js` 里的扫码组件）走的是浏览器 `fetch`，浏览器自己带 UA；
+ * 官方桌面端走 Electron 的网络栈，也自带一个 UA。我们这里是从 Node 进程发的裸请求，
+ * **默认没有 UA** —— 2026-11-12 起补上，让服务端看到的是同一个"网页客户端"。
+ *
+ * 值取常见的 Windows Chrome UA：我们的 code 是用网页端那套（`appname=小浣熊官网`）
+ * 生成的，UA 与 code 来源保持一致，比"伪装成 Electron"更不容易被服务端按来源分流。
+ */
+const WEB_POLL_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/**
+ * 官方网页端随轮询一起发的注册归因（`60488` 模块的 `$Y()`）。
+ *
+ * 原样照抄形状：`{ registration_source: "web", ...utm_*, referrer? }`。
+ * 我们不带 utm（没有来源页），只给 `registration_source`。
+ */
+const WEB_ATTRIBUTION = { registration_source: "web" } as const;
+
+/** 轮询选项。`attributed: false` 只为单测 —— 生产永远带上 UA 与归因。 */
+export interface WebPollOptions {
+  attributed?: boolean;
+}
+
+/** 取第一个非空字符串。用来兼容顶层 / 嵌套、camelCase / snake_case 几种令牌形状。 */
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
 
 /**
  * 生成一个 code。
@@ -98,10 +147,19 @@ export function isWebCode(value: unknown): value is string {
  * **网络错误返回 `pending` 而不是抛** —— 与 `iam.ts` 的 `pollQr` 同一条原则：
  * 一次抖动不能把用户的登录过程杀掉。
  */
-export async function pollWebSession(code: string, fetchImpl: typeof fetch = fetch): Promise<WebQrPoll> {
+export async function pollWebSession(
+  code: string,
+  fetchImpl: typeof fetch = fetch,
+  options: WebPollOptions = {},
+): Promise<WebQrPoll> {
   if (!isWebCode(code)) {
     return { status: "error", message: "扫码会话已失效" };
   }
+
+  // 归因与 UA：官方网页端两者都带（见 `WEB_POLL_UA` / `WEB_ATTRIBUTION` 注释）。
+  // 服务端是否真按它们绑会话，2026-11-12 还没法证伪 —— 但**带上没有代价**，
+  // 而漏带是有代价的（用户实测"微信端点了确认，插件永远收不到 success"）。
+  const attributed = options.attributed !== false;
 
   let response: Response;
   try {
@@ -109,8 +167,14 @@ export async function pollWebSession(code: string, fetchImpl: typeof fetch = fet
       method: "POST",
       redirect: "error",
       cache: "no-store",
-      headers: { accept: "application/json", "content-type": "application/json" },
-      body: JSON.stringify({ qrcode_code: code }),
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        ...(attributed ? { "user-agent": WEB_POLL_UA } : {}),
+      },
+      body: JSON.stringify(
+        attributed ? { qrcode_code: code, registration_attribution: WEB_ATTRIBUTION } : { qrcode_code: code },
+      ),
       signal: AbortSignal.timeout(20_000),
     });
   } catch {
@@ -147,25 +211,51 @@ export async function pollWebSession(code: string, fetchImpl: typeof fetch = fet
 
   switch (raw) {
     case "success": {
-      const tokens = data["tokens"] as Record<string, unknown> | undefined;
-      const accessToken = tokens?.["accessToken"] ?? tokens?.["access_token"];
-      if (typeof accessToken !== "string" || accessToken.length === 0) {
+      // **令牌在 `data` 顶层**，不在 `data.tokens` 里 —— 这是 2026-11-12 用官方
+      // 两份实现交叉验证出来的：网页端 `23127.*.js` 从 `data` 解构
+      // `{status, expired_at, access_token, refresh_token}`；桌面端
+      // `accountRequests.js` 的 `tokens(data, true)` 读的也是 `data.access_token`。
+      //
+      // 早先这里读的是 `data.tokens.accessToken`，于是**即使服务端回了 success，
+      // 我们也一律判成"没有带令牌"** —— 用户看到的现象正是"手机点了确认，
+      // 插件一点反应都没有"。三种形状都兼容，但顶层优先。
+      const nested = (data["tokens"] ?? data["token"]) as Record<string, unknown> | undefined;
+      const accessToken = firstString(
+        data["access_token"],
+        data["accessToken"],
+        nested?.["access_token"],
+        nested?.["accessToken"],
+      );
+      if (accessToken === undefined) {
         return { status: "error", message: "小浣熊返回了登录成功，但没有带令牌。" };
       }
-      return { status: "success", accessToken, ...(expiresIn === undefined ? {} : { expiresIn }) };
+      // `refresh_token` 一并收下但**不落盘**（ADR-0011：用了会 rotate，
+      // 把官方客户端踢下线）。这里只让它出现在返回值里，供诊断/测试断言。
+      const refreshToken = firstString(
+        data["refresh_token"],
+        data["refreshToken"],
+        nested?.["refresh_token"],
+        nested?.["refreshToken"],
+      );
+      return {
+        status: "success",
+        accessToken,
+        ...(refreshToken === undefined ? {} : { refreshToken }),
+        ...(expiresIn === undefined ? {} : { expiresIn }),
+      };
     }
     case "logging":
-      return { status: "logging", ...(expiresIn === undefined ? {} : { expiresIn }) };
+      return { status: "logging", rawStatus: raw, ...(expiresIn === undefined ? {} : { expiresIn }) };
     case "canceled":
     case "cancelled":
       return { status: "canceled" };
     case "expired":
       return { status: "expired" };
     case "pending":
-      return { status: "pending", ...(expiresIn === undefined ? {} : { expiresIn }) };
+      return { status: "pending", rawStatus: raw, ...(expiresIn === undefined ? {} : { expiresIn }) };
     default:
       // 未知状态不杀流程：上游可能加了新状态。当作 pending 继续问。
-      return { status: "pending", ...(expiresIn === undefined ? {} : { expiresIn }) };
+      return { status: "pending", rawStatus: raw, ...(expiresIn === undefined ? {} : { expiresIn }) };
   }
 }
 

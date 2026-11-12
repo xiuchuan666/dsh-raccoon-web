@@ -1,5 +1,5 @@
 /**
- * HTTP 路由：状态快照 + 十四个 action（`?action=` 分发，见 `host/index.ts` 的 `runAction()`）。
+ * HTTP 路由：状态快照 + 十六个 action（`?action=` 分发，见 `host/index.ts` 的 `runAction()`）。
  *
  * ## 为什么走 HTTP 而不是别的
  *
@@ -19,7 +19,7 @@
  *
  * `webServer.register({kind:"exact", path})` 是精确匹配（不支持 `:param`）。
  * 想用 RESTful 路径就得为每个 action 注册一条路由，每条各自要挂 `ctx.effect`。
- * 一个 query 参数换十四个 action 共用两条路由，划算。
+ * 一个 query 参数换十六个 action 共用两条路由，划算。
  *
  * @module host/routes
  */
@@ -209,16 +209,18 @@ function errText(error: unknown): string {
  * status 里 principal 只给前 8 位，而日志里给的是 token 的 sha256 前 8 位 ——
  * 两个不同的东西，别混。
  */
-export function loginBlock(snapshot: LoginSnapshot, token: { principal?: string; kind?: "access_token" | "xhx_token"; expiresAt?: number; source?: "qr" | "desktop" } | undefined): {
+export function loginBlock(snapshot: LoginSnapshot, token: { principal?: string; kind?: "access_token" | "xhx_token"; expiresAt?: number; source?: "qr" | "desktop" | "browser" } | undefined): {
   phase: LoginSnapshot["phase"];
   qrSvg?: string;
   deadline?: number;
   message?: string;
   mode?: LoginSnapshot["mode"];
+  lastPoll?: string;
+  lastPollAt?: number;
   principal?: string;
   kind?: "access_token" | "xhx_token";
   expiresAt?: number;
-  source?: "qr" | "desktop";
+  source?: "qr" | "desktop" | "browser";
 } {
   const out: ReturnType<typeof loginBlock> = { phase: snapshot.phase };
   if (snapshot.qrSvg !== undefined) out.qrSvg = snapshot.qrSvg;
@@ -226,6 +228,9 @@ export function loginBlock(snapshot: LoginSnapshot, token: { principal?: string;
   if (snapshot.message !== undefined) out.message = snapshot.message;
   // 前端靠它分辨"这张二维码是主登录的还是加池成员的"，两个区各自认领。
   if (snapshot.mode !== undefined) out.mode = snapshot.mode;
+  // 排障用：服务端上一次到底回了什么（"扫了没反应"时唯一能区分原因的证据）。
+  if (snapshot.lastPoll !== undefined) out.lastPoll = snapshot.lastPoll;
+  if (snapshot.lastPollAt !== undefined) out.lastPollAt = snapshot.lastPollAt;
   if (token?.principal !== undefined) out.principal = token.principal.slice(0, 8);
   if (token?.kind !== undefined) out.kind = token.kind;
   if (token?.expiresAt !== undefined) out.expiresAt = token.expiresAt;

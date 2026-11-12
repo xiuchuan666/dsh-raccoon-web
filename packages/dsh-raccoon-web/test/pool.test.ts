@@ -24,6 +24,7 @@ import { describe, it } from "node:test";
 import {
   classifyMeasure,
   isCooling,
+  mergePools,
   newDeviceId,
   nextRaccoonMidnight,
   poolAccountId,
@@ -336,6 +337,46 @@ describe("upsertAccount", () => {
     list = upsertAccount(list, { token: "t", kind: "access_token", principal: "pu-b", source: "desktop", now: 2 });
     assert.equal(list.length, 2);
     assert.deepEqual(list.map((a) => a.source), ["qr", "desktop"]);
+  });
+
+  it("PO-32b source 跟着最后一次来源走（先扫码后导入桌面端凭据）", () => {
+    // 早先是 `existing?.source ?? input.source`，于是先扫码加进来的号
+    // 后来用桌面端凭据导入，source 永远停在 `qr`。它此刻持有的明明是
+    // 桌面端 token，标成 `qr` 会让排障时分不清"要不要去客户端重登"。
+    const first = upsertAccount([], { token: "old", kind: "access_token", principal: "pu-a", source: "qr", now: 1 });
+    const again = upsertAccount(first, { token: "new", kind: "access_token", principal: "pu-a", source: "desktop", now: 2 });
+    assert.equal(again[0]?.source, "desktop");
+  });
+});
+
+describe("mergePools", () => {
+  it("PO-41 两边并集，同 id 以内存为准", () => {
+    const memory = [account({ id: "aaa", enabled: true, token: "mem-a" })];
+    const disk = [account({ id: "aaa", enabled: false, token: "disk-a" }), account({ id: "bbb", token: "disk-b" })];
+    const merged = mergePools(memory, disk);
+    assert.equal(merged.length, 2, "磁盘独有那个不能丢");
+    const a = merged.find((x) => x.id === "aaa");
+    assert.equal(a?.token, "mem-a", "同 id 用内存那份（内存才是这个实例当前的决定）");
+    assert.equal(a?.enabled, true);
+    assert.equal(merged.find((x) => x.id === "bbb")?.token, "disk-b");
+  });
+
+  it("PO-42 空的一边不改变另一边（这是'导入第二个号，第一个号消失'的根因）", () => {
+    // 内存比磁盘旧（比如插件刚启动还没读到、或上一次写入失败只更新了内存）时，
+    // 直接 writePool(内存) 会把磁盘上那些账号整片抹掉。mergePools 保证
+    // 磁盘独有的账号一定活下来。
+    const disk = [account({ id: "aaa" }), account({ id: "bbb" })];
+    assert.deepEqual(mergePools([], disk).map((x) => x.id), ["aaa", "bbb"]);
+    assert.deepEqual(mergePools(disk, []).map((x) => x.id), ["aaa", "bbb"]);
+    assert.deepEqual(mergePools([], []), []);
+  });
+
+  it("PO-43 顺序：磁盘在前、内存覆盖位置不变（整表写出去要可复现）", () => {
+    const disk = [account({ id: "aaa" }), account({ id: "bbb" })];
+    const memory = [account({ id: "bbb", token: "new-b" }), account({ id: "ccc" })];
+    const merged = mergePools(memory, disk);
+    assert.deepEqual(merged.map((x) => x.id), ["aaa", "bbb", "ccc"]);
+    assert.equal(merged.find((x) => x.id === "bbb")?.token, "new-b");
   });
 });
 

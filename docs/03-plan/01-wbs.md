@@ -372,9 +372,9 @@
 | P-11 | 诊断块 13 → 14 行（「号池」五种形态），同步改 ST-25 / ST-25b / ST-25c | `host/status.ts` + `test/host.test.ts` | ✗ |
 | P-12 | `PoolSection` 客户端 UI（账号卡片、勾选即时生效、两段式删除、二维码跟宿主状态走） | `client.js` | ✗ |
 | P-13 | 修 `device` 显示成 `raccoon-`（`slice(0,8)` 把前缀整个吃掉） | `host/index.ts` 的 `poolSnapshot()` | ✗ |
-| P-14 | 真宿主端到端：导入 → 测试（零 token 成本打目录端点）→ 勾选 → 开关 → `activeId` 正确 → 诊断第 14 行 | 端口 52091，build `2026-11-11T23:05` | 部分（T-11 只预估了"能加载"） |
+| P-14 | 真宿主端到端：导入 → 测试（零 token 成本打目录端点）→ 勾选 → 开关 → `activeId` 正确 → 诊断第 14 行 | 端口 52091，build `2026-11-12T01:20` | 部分（T-11 只预估了"能加载"） |
 | P-15 | 补 `test/pool.test.ts`（PO-1 ~ PO-35，10 个 suite）：纯函数全覆盖 + 落盘往返 | `test/` | ✗ |
-| P-16 | 补 `scripts/smoke-pool.mjs`（初版 10 段 41 条，后补到 **12 段 56 条**）：真 `RaccoonHost` + 假网关跑六个 action，验设备头真的进了请求、换号真的重建名册、签到真的先查后写 | `scripts/` + `package.json` 的 `smoke` / `smoke:pool` | ✗ |
+| P-16 | 补 `scripts/smoke-pool.mjs`（初版 10 段 41 条 → 12 段 56 条 → 2026-11-12 补第 9 段后 **13 段 82 条**）：真 `RaccoonHost` + 假网关跑十三个 action，验设备头真的进了请求、换号真的重建名册、签到真的先查后写 | `scripts/` + `package.json` 的 `smoke` / `smoke:pool` | ✗ |
 
 ### 偏差教训（这一轮新增六条）
 

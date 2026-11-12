@@ -9,13 +9,14 @@
  *                    │                    logging（已扫码，等确认）
  *                    │                          │
  *                    └──── success ────────────┘──▶ ready
- *                    └──── expired/canceled/error ──▶ none
+ *                    └──── expired/error ──────────▶ none
+ *                    └──── canceled ───────────────▶ 换一张新码，仍在 pending
  * ```
  *
  * `ready` 不是这里的最终态 —— 拿到 token 后由 `publish.ts` 注册 provider。
  * 这里只负责"把二维码给出去、把 token 收回来、存下来"。
  *
- * ## 四个容易写错的点
+ * ## 五个容易写错的点
  *
  * 1. **网络抖动不能杀掉登录。** `pollQr()` 内部已经把 NETWORK_ERROR/TIMEOUT
  *    转成 `pending`（iam.ts 的注释），这里不能再做一次判断去取消。
@@ -28,6 +29,11 @@
  *    不能报"登录成功"然后让用户在对话时才看到 401。
  * 4. **cancel 之后不能再写状态。** 用户点了取消／重新扫码，旧流程的在途
  *    轮询还会回来一次；用一个自增的 `generation` 把它丢弃。
+ * 5. **`canceled` 不是结束，是换码。** 官方网页端遇 `canceled` 立刻重开一轮
+ *    （`23127.*.js`：`if("canceled"===r) return void c();`）。我们早先把它当
+ *    "用户取消登录"收尾，于是手机上点了「取消本次登录」之后界面留下的是
+ *    "已取消扫码" + 一张已作废的码，只能手动重开。现在跟官方一致，
+ *    但加了 `MAX_REISSUES` 上限防止请求风暴（见该常量注释）。
  *
  * @module host/login-flow
  */
@@ -43,6 +49,19 @@ import { saveToken, type StoredToken } from "./store.js";
 
 /** 登录阶段。`ready` 表示已有可用 token。 */
 export type LoginPhase = "none" | "pending" | "logging" | "ready" | "expired" | "error";
+
+/**
+ * 一轮登录里最多因为 `canceled` 换几次码。
+ *
+ * 官方网页端换码是无条件的（`if("canceled"===r) return void c();`），
+ * 但那边是人在盯着屏幕，换一次码就是一次用户可见的动作。
+ * 我们是后台每 2 秒轮询一次：万一服务端对某个 code 一直回 `canceled`
+ * （比如它把这个 code 认成了"已作废"），无限换码就是每 2 秒一次
+ * 后台请求，用户还完全不知道发生了什么。所以给个上限，
+ * 超了就把这一轮收掉，让用户手动重新获取 —— 这是"看得见的失败"，
+ * 比"界面一直转圈"好。
+ */
+const MAX_REISSUES = 3;
 
 /**
  * 这一轮扫码登录的目的是什么（ADR-0010 §4）。
@@ -65,6 +84,18 @@ export interface LoginSnapshot {
   deadline?: number;
   /** 用户可读提示。`phase === "error"` 时是错误说明。 */
   message?: string;
+  /**
+   * 最近一次轮询服务端回的原始状态（`pending` / `logging` / `canceled` /
+   * `expired` / `success` / `error:xxx`）。
+   *
+   * 为什么要暴露它：扫码登录失败时，用户能看到的只有"没反应"或一句文案，
+   * 而真正需要知道的是**服务端到底回了什么**。没有这个字段时只能靠猜
+   * （2026-11-12 就为此白跑了一轮取证）。现在它出现在 `status` 里，
+   * 一句 curl 就能看到。
+   */
+  lastPoll?: string;
+  /** `lastPoll` 的时刻（epoch ms）。 */
+  lastPollAt?: number;
   /**
    * 这一轮（或当前这个 token）是给谁用的：换当前账号，还是往池里加一个号。
    *
@@ -132,6 +163,18 @@ export class LoginFlow {
    * 所以每轮重置，且必须由 `start()` 的参数决定。
    */
   private mode: LoginMode = "primary";
+  /**
+   * 本轮已经因为 `canceled` 换过几次码。
+   *
+   * 官方网页端换码是无条件的，但那边是人在盯着屏幕；我们这边是后台轮询，
+   * 如果服务端对一个坏掉的 code 一直回 `canceled`，无限换码就会变成
+   * 每 2 秒一次的后台请求风暴。设一个上限，超了就老老实实报"已取消"。
+   */
+  private reissues = 0;
+  /** 服务端上一次轮询回的原始状态。排障用，只在 pending/logging 时进快照。 */
+  private lastPoll: string | undefined;
+  /** `lastPoll` 的时刻。 */
+  private lastPollAt: number | undefined;
   private disposed = false;
 
   constructor(options: LoginFlowOptions) {
@@ -153,6 +196,12 @@ export class LoginFlow {
       base.deadline = this.deadline;
     }
     if (this.message !== undefined) base.message = this.message;
+    // 诊断字段：**只在这一轮还在等的时候给**。`ready` 之后它已经没有意义，
+    // 留着只会让排障的人以为"登录还在轮询"。
+    if (this.lastPoll !== undefined && (this.phase === "pending" || this.phase === "logging")) {
+      base.lastPoll = this.lastPoll;
+      if (this.lastPollAt !== undefined) base.lastPollAt = this.lastPollAt;
+    }
     return base;
   }
 
@@ -164,6 +213,14 @@ export class LoginFlow {
    * 停在 pending 的空二维码框。
    */
   async start(mode: LoginMode = "primary"): Promise<LoginSnapshot> {
+    // 用户（或界面轮询）主动开的一轮：换码计数从零开始。
+    // `reissue()` 不走这里，它直接调 `beginRound()`，好让计数跨换码累积。
+    this.reissues = 0;
+    return await this.beginRound(mode);
+  }
+
+  /** `start()` 与 `reissue()` 共用的一轮开场。不改 `reissues`。 */
+  private async beginRound(mode: LoginMode): Promise<LoginSnapshot> {
     if (this.disposed) return this.snapshot();
     this.cancel();
     const generation = this.generation;
@@ -226,6 +283,10 @@ export class LoginFlow {
     this.code = undefined;
     this.qrSvg = undefined;
     this.deadline = undefined;
+    // 诊断字段跟着这一轮一起清掉：留着上一轮的状态会让下一次排障看到
+    // 一张新码配一条旧结果，比没有更误导。
+    this.lastPoll = undefined;
+    this.lastPollAt = undefined;
     // ready 是"已有 token"，不该被 cancel 打回 none：cancel 只取消进行中的
     // 登录，不登出。登出走 logout()。
     if (this.phase !== "ready") this.phase = "none";
@@ -295,9 +356,56 @@ export class LoginFlow {
     this.options.logger.warn("login/error", { message: this.message });
   }
 
+  /**
+   * 换一张新码，继续这一轮登录。
+   *
+   * 只在服务端说 `canceled` 时调（用户在手机上点了「取消本次登录」）。
+   * 官方网页端就是直接重开一轮；我们照抄，但**保留 `mode`** ——
+   * 池模式换码之后仍然是池模式，不能悄悄变回主登录。
+   */
+  private async reissue(generation: number): Promise<void> {
+    if (this.disposed || generation !== this.generation) return;
+    // 换码上限：服务端如果对每一张新码都回 `canceled`，我们就会每 2 秒
+    // 换一次码、每 2 秒发一次请求，永远不收敛。到上限就把这一轮收掉，
+    // 让用户自己决定要不要重新点一次。
+    if (this.reissues >= MAX_REISSUES) {
+      this.options.logger.warn("login/reissue-exhausted", { reissues: this.reissues });
+      this.phase = "none";
+      this.qrSvg = undefined;
+      this.deadline = undefined;
+      this.message = "二维码反复失效，请重新获取。";
+      return;
+    }
+    this.reissues += 1;
+    const mode = this.mode;
+    // 走 `beginRound()` 而不是 `start()` —— 后者会把 `reissues` 清零，
+    // 于是上限永远触发不了。
+    await this.beginRound(mode);
+    if (this.disposed) return;
+    // `beginRound()` 会把 message 清空；这里补一句，让用户知道"码换了"
+    // 而不是以为界面卡住。
+    if (this.phase === "pending") this.message = "二维码已刷新，请重新扫码。";
+  }
+
+  /**
+   * 用服务端给的剩余秒数校正本地 deadline。
+   *
+   * 为什么需要：Web auth 码是**本地生成**的，起手那个 300 秒是抄官方客户端的
+   * 粗估，没有任何服务端依据。而 `login_with_qrcode_code` 在 `logging` 阶段
+   * 会带 `expired_at`（官方网页端正是在那里记下它）。以服务端为准能避免
+   * 两种错：本地比服务端短 → 用户明明还能确认却被我们判过期；本地比服务端
+   * 长 → 用户扫一张已经死掉的码。
+   *
+   * 只往"更晚"或"更早"两边都接受 —— 服务端说几秒就几秒，不做 max/min 取巧。
+   */
+  private applyServerDeadline(expiresIn: number | undefined): void {
+    if (expiresIn === undefined) return;
+    const next = this.now() + Math.max(1, Math.min(expiresIn, LOGIN_TIMEOUT_MS / 1000)) * 1000;
+    this.deadline = next;
+  }
+
   /** 排下一次轮询。间隔取上游给的 pollInterval，兜底 2s。 */
-  private schedule(delayMs: number): void {
-    if (this.timer !== undefined) clearTimeout(this.timer);
+  private schedule(delayMs: number): void {    if (this.timer !== undefined) clearTimeout(this.timer);
     const wait = Math.max(500, delayMs > 0 ? delayMs : (this.options.pollIntervalMs ?? QR_POLL_INTERVAL_MS));
     this.timer = setTimeout(() => {
       this.timer = undefined;
@@ -341,9 +449,17 @@ export class LoginFlow {
     }
     if (this.disposed || generation !== this.generation) return;
 
+    // 记下服务端这一次到底回了什么。排障时这一条比什么都管用：
+    // "扫了没反应"要么是服务端一直 pending（码没被认），要么是回了个我们
+    // 没见过的状态（被 default 当 pending）。没有这个字段就只能靠猜。
+    this.lastPoll =
+      poll.status === "error" && poll.message !== undefined ? `error:${poll.message}` : poll.status;
+    this.lastPollAt = this.now();
+
     switch (poll.status) {
       case "pending":
         this.phase = "pending";
+        this.applyServerDeadline(poll.expiresIn);
         this.schedule((poll.pollInterval ?? 2) * 1000);
         return;
 
@@ -351,6 +467,10 @@ export class LoginFlow {
         // 这个阶段必须与 pending 区分：文案不同的同时，**不要重置二维码**，
         // 否则用户会以为是新码而重扫。
         this.phase = "logging";
+        // 服务端在 `logging` 时才第一次给 `expired_at`（官方网页端就是在这里
+        // 记下它，之后按它判过期）。我们本地那个 300 秒的粗估没有依据，
+        // 以服务端为准。
+        this.applyServerDeadline(poll.expiresIn);
         this.schedule((poll.pollInterval ?? 2) * 1000);
         return;
 
@@ -372,10 +492,13 @@ export class LoginFlow {
         return;
 
       case "canceled":
-        this.phase = "none";
-        this.qrSvg = undefined;
-        this.deadline = undefined;
-        this.message = "已取消扫码。";
+        // 官方网页端遇 `canceled` 是**立刻换一张新码**（`23127.*.js`：
+        // `if("canceled"===r) return void c();`），不是结束这一轮。
+        //
+        // 我们早先把它当"用户取消登录"收尾，于是用户手机上点了「取消本次登录」
+        // 之后，界面上留下的是"已取消扫码" + 一张已经作废的码，只能手动重开。
+        // 现在跟官方一致：换码继续等，用户随时可以再扫。
+        void this.reissue(generation);
         return;
 
       default:

@@ -6,7 +6,7 @@
 > 这个项目的测试分三层：**不依赖宿主**的协议层单测、**mock 内核**的宿主层单测、**必须真人参与**的端到端验证。
 > 第三层是这个项目的主要风险来源 —— 它无法自动化（要用手机微信扫码），所以必须写成"可复述的步骤"，让人照着做。
 
-**当前实测数字（2026-11-11）**：**220 tests / 45 suites / 220 pass / 0 fail**，7 个测试文件，纯 `node --test`，无 vitest / jest。
+**当前实测数字（2026-11-12）**：**263 tests / 52 suites / 263 pass / 0 fail**，8 个测试文件，纯 `node --test`，无 vitest / jest。
 
 | 文件 | tests | suites | suite 名 |
 | --- | --- | --- | --- |
@@ -30,7 +30,7 @@ npm test                           # 220 个用例
 node scripts/verify-install.mjs    # 24 项静态检查（装得上、能解析、版本一致）
 node scripts/smoke-host.mjs        # 宿主半身（假 ctx，不碰网络）
 node scripts/smoke-provider.mjs    # provider 装配 + 换名册必须换实例
-node scripts/smoke-pool.mjs        # 号池（真 RaccoonHost + 假网关，41 条断言）
+node scripts/smoke-pool.mjs        # 号池 + 浏览器 loopback 加号（真 RaccoonHost + 假网关，13 段 82 条断言）
 node scripts/smoke-client-apply.mjs          # 离线跑 client.js 的 apply
 node scripts/smoke-client-apply.mjs --twice  # 模拟同一包被加载两次
 node scripts/smoke-desktop-auth.mjs          # 桌面端凭据路线
@@ -342,13 +342,17 @@ https://xiaohuanxiong.com/login/mp?code=<13位时间戳+32hex>&appname=%E5%B0%8F
 判定：✅ status.pool.activeId 非空，publish 仍 published
 5.  点「一键签到」
 判定：✅ 每行一个结果（已签到 / 今日已签 / 失败），单个失败不中断
-6.  点「扫码添加」→ 手机扫
-判定：✅ 新号默认 enabled=false；**主登录相位不变**、token.json 不被写
-7.  移除一个号
+6.  点「浏览器登录」→ 在浏览器里登录
+判定：🟡 `browser.active:true` + `/authorize` URL 已实测；**"真的登进去 → 回调带回 code → 换到 token → 进池"整段没人跑过**
+7.  点「扫码添加」→ 手机扫
+判定：❌ `/login/mp` 已 404（E-040），`qrProtocol: "web"` 下必然失败；只有 `qrProtocol: "iam"` 还有意义
+8.  移除一个号
 判定：✅ 两段式确认（点一次变「确认移除」，再点才删）
 ```
 
-**3.6 的第 5、6 步至今没跑过**（当日已领、需真人扫码）。第 7 步也没在真宿主上跑过（只在 `smoke-pool.mjs` 里跑过）。
+**没跑过的三步**：第 5 步（当日已领，只能等北京零点后）、第 6 步的"真的登进去"（要真人在浏览器里登录一次）、第 7 步（要手机，且 `web` 协议已死）。
+
+第 6 步除"真登录"以外的全部由 `scripts/smoke-pool.mjs` **第 9 段 23 条断言**覆盖：URL 形状（`/authorize` + `desktop_callback=loopback` + `redirect` 指回 `127.0.0.1:<port>/auth/callback` + `state` 64 hex）、错 state → 400 且**不打换码端点**、假 code → 502 且页面有服务端文案、失败不污染池、合法 code → 池里多一个 `source:"browser"` 且默认 `enabled:false`、取消与重复取消。
 
 ---
 
@@ -359,7 +363,7 @@ https://xiaohuanxiong.com/login/mp?code=<13位时间戳+32hex>&appname=%E5%B0%8F
 | 启动开销 | `apply` 到 `loaded` 的毫秒数 | < 50ms（apply 里不做网络请求） | ✅ `apply` 同步、网络在 `void bootstrap()` 里 |
 | 内存 | 任务管理器看宿主进程 | 增量 < 20MB | ✅ 未做量化，`lib/index.js` 145 KB 是唯一常驻 |
 | token 泄露（日志） | `grep -rE "eyJ|Bearer [A-Za-z0-9]" <日志目录>` | 0 命中 | ✅ 单测 ST-23 断言 + `tokenTag()` 只输出 `sha256` 前 8 位 |
-| token 泄露（status） | `curl <PORT>/plugins/dsh-raccoon-web/status` | 响应里**没有** token 原文、没有 deviceId 全文 | ✅ `smoke-pool.mjs` 第 8 段断言 |
+| token 泄露（status） | `curl <PORT>/plugins/dsh-raccoon-web/status` | 响应里**没有** token 原文、没有 deviceId 全文、没有 `"token"` 键 | ✅ `smoke-pool.mjs` 第 8 段断言 |
 | 构建产物 | `ls lib/` | 只有 `index.js` + `client.js`（**无 chunk**） | ✅ `verify-install` 第 7 项 |
 | 依赖 | `npm ls --omit=dev` | 0 个运行时依赖 | ✅ `verify-install` 第 6 项 |
 | 路由冲突 | 重复 link 两次 | 不报 409 | ✅ `link.mjs` 幂等，四步全命中「已就绪」 |

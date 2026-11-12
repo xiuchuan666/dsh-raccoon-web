@@ -114,23 +114,51 @@ describe("pollWebSession", () => {
     const call = fetchImpl.calls[0]!;
     assert.equal(call.url, "https://xiaohuanxiong.com/api/web/auth/v1/login_with_qrcode_code");
     assert.equal(call.method, "POST");
-    assert.deepEqual(JSON.parse(call.body!), { qrcode_code: code });
+    // 2026-11-12 起轮询带注册归因（照抄官方网页端 `60488` 模块的 `$Y()`）。
+    assert.deepEqual(JSON.parse(call.body!), {
+      qrcode_code: code,
+      registration_attribution: { registration_source: "web" },
+    });
+    // 也带 UA：官方网页端是浏览器发的，浏览器天然有 UA；Node 裸请求没有。
+    assert.match(call.headers?.["user-agent"] ?? "", /Mozilla\/5\.0/);
   });
 
-  it("WA-11: success 带 accessToken，两种大小写键名都认", async () => {
+  it("WA-10b: attributed:false 退回裸请求（只为单测可控）", async () => {
     const code = generateWebCode();
-    const camel = await pollWebSession(
-      code,
-      fakeFetch(json(200, { code: 0, data: { status: "success", tokens: { accessToken: "tok-a" } } })),
-    );
-    assert.equal(camel.status, "success");
-    assert.equal(camel.accessToken, "tok-a");
+    const fetchImpl = fakeFetch(json(200, { code: 0, data: { status: "pending" } }));
+    await pollWebSession(code, fetchImpl, { attributed: false });
+    const call = fetchImpl.calls[0]!;
+    assert.deepEqual(JSON.parse(call.body!), { qrcode_code: code });
+    assert.equal(call.headers?.["user-agent"], undefined);
+  });
 
-    const snake = await pollWebSession(
+  it("WA-11: success 带令牌 —— **顶层 access_token 是主形状**，嵌套是兼容", async () => {
+    const code = generateWebCode();
+
+    // 主形状：官方网页端（`23127.*.js`）与桌面端（`accountRequests.js` 的
+    // `tokens(data, true)`）读的都是 `data` 顶层。2026-11-12 之前的实现只读
+    // `data.tokens.*`，于是"服务端回了 success 我们也判成没有令牌"。
+    const top = await pollWebSession(
       code,
-      fakeFetch(json(200, { code: 0, data: { status: "success", tokens: { access_token: "tok-b" } } })),
+      fakeFetch(json(200, { code: 0, data: { status: "success", access_token: "tok-top", refresh_token: "ref-top" } })),
     );
-    assert.equal(snake.accessToken, "tok-b");
+    assert.equal(top.status, "success");
+    assert.equal(top.accessToken, "tok-top");
+    assert.equal(top.refreshToken, "ref-top");
+
+    // 兼容：camelCase 顶层
+    const camelTop = await pollWebSession(
+      code,
+      fakeFetch(json(200, { code: 0, data: { status: "success", accessToken: "tok-camel" } })),
+    );
+    assert.equal(camelTop.accessToken, "tok-camel");
+
+    // 兼容：早期假设的嵌套形状
+    const nested = await pollWebSession(
+      code,
+      fakeFetch(json(200, { code: 0, data: { status: "success", tokens: { access_token: "tok-nested" } } })),
+    );
+    assert.equal(nested.accessToken, "tok-nested");
   });
 
   it("WA-12: success 没带令牌是错误，不是 success", async () => {

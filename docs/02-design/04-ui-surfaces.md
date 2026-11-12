@@ -303,9 +303,22 @@ var seconds = useCountdown(phase === 'pending' || phase === 'logging' ? login.de
   ☐ 3f0a91cc   pu-02b3...                        限流中
      设备 91aa02f1 · 冷却到 21:10                      [测试] [移除]
 
-  [扫码添加]  [导入客户端账号]  [一键签到]
+  [浏览器登录]  [扫码添加]  [导入客户端账号]  [一键签到]
   新加进来的账号默认不启用，勾上才会被拿去发请求。
 ```
+
+点「浏览器登录」后多一张卡片（`data-raccoon-browser`）：
+
+```
+┌────────────────────────────────────────────────────────────┐
+│ 正在等待浏览器完成登录（最多 5 分钟）。                       │
+│ 在浏览器里用手机号或微信登录，完成后浏览器会跳回本机，         │
+│ 这个页面会自动出现新账号。官方客户端换账号用的就是这条路。      │
+│                                    [打开授权页]  [取消等待] │
+└────────────────────────────────────────────────────────────┘
+```
+
+成功/超时/失败之后卡片消失，只在下面留一行 `browser.message`（例如「已加入账号池（pu-01a1c）。新加的号默认未启用…」或 `authorization_code_not_found_error`）。
 
 | 元素 | 动作 | 说明 |
 | --- | --- | --- |
@@ -313,9 +326,15 @@ var seconds = useCountdown(phase === 'pending' || phase === 'logging' ? login.de
 | 勾选框 | `pool-toggle` `{id, enabled}` | **即时生效**，写盘失败回滚内存并提示 |
 | 测试 | `pool-test` `{id}` | 用该号凭据打 `model_catalog`，**零 token 成本**；也是唯一能让 `dead` 回池的路径 |
 | 移除 | `pool-remove` `{id}` | **两段式**（第一次点变「确认移除」），不用 `window.confirm` |
-| 扫码添加 | `pool-add-start` | 走 `LoginFlow.start("pool")`，**不写 `token.json`、不改主登录相位** |
+| **浏览器登录** | `pool-add-browser` | **加号主路线**（ADR-0012）。本机起一次性回调服务 + 打开 `/authorize`；返回 `status.browser`，**不写 `token.json`、不改主登录相位** |
+| 取消等待 | `pool-add-browser-cancel` | 关掉回调服务并清 `browserLogin`；超时（5 分钟）也走同一条收尾 |
+| 扫码添加 | `pool-add-start` | 走 `LoginFlow.start("pool")`。**2026-11-12 起 Web auth 码页面 `/login/mp` 已 404**（E-040），这条只剩 IAM 小程序码还能用 |
 | 导入客户端账号 | `pool-import-desktop` | 只读 `auth.json` 拿 token，不复制文件 |
-| 一键签到 | `pool-checkin` | 遍历**全部**账号（含未启用）；先查流水再写；单个失败只标该行 |
+| 一键签到 | `pool-checkin` | 遍历**全部**账号（含未启用）；先查流水再写；单个失败只标该行，**并把失败翻成测量状态**（凭据失效 → 卡片立刻显示「凭据失效」）。结果逐号显示在账号卡片上：绿=已签到/今日已签，红=签到失败 · 上游原文第一行 |
+
+**为什么加号有两条路、且 loopback 是主路线**：`/login/mp` 这个页面在服务端已经不存在了（11 组 UA / header 组合全 404，RSC 流里明确是 `notFound`），所以本地生成的 Web auth 码无论怎么扫，微信端只会看到「二维码已过期或已被使用」。而官方桌面端换账号走的是浏览器 `/authorize` + 本机 loopback 回调（`desktop_callback=loopback`），这条路上 `/authorize` 对裸请求返回 200、`login_with_authorization_code` 对假 code 会返回 400 `200035`（**说明它真的在校验**）。扫码那条**不删**：IAM 小程序码是另一套命名空间，不受影响，是唯一还能被微信扫的一种。
+
+**浏览器登录的状态从 `status.browser` 读，不自己记**：用户可能在浏览器里花一两分钟，会切走设置卡再切回来；自己记的 `pending` 一丢，界面就会显示"没在等"而实际还在等。`StatusBrowser` 形状是 `{ active, url?, port?, startedAt?, message? }`，**不含 code、不含 token**。
 
 **三条从 workbuddy 学来的硬约束**（写进 `PoolSection` 的文件头注释）：
 
@@ -375,7 +394,7 @@ var pendingIsPool = login !== undefined && login.mode === 'pool';
 
 ```
 插件: dsh-raccoon-web 0.1.0
-build: 2026-11-11T23:05
+build: 2026-11-12T01:20
 平台: win32 / node v24.21.0
 登录: ready (access_token)
 来源: 官方客户端凭据
@@ -424,7 +443,7 @@ var dimStyle = { color: 'var(--dsh-text-secondary, #6b7280)', fontSize: '12px' }
 
 ---
 
-## 10. 文案（内联，各 117 键：88 + 29 个 `pool*`）
+## 10. 文案（内联，各 124 键：89 + 35 个 `pool*`）
 
 ```js
 var zh = { pillLoading: '小浣熊 · 读取中', ... };

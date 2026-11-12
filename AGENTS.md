@@ -66,7 +66,7 @@ ADR 是**当时的判断记录**，不是"当前最佳实践"。要推翻它，�
 
 | 路径 | 谁可以改 |
 | --- | --- |
-| `packages/dsh-raccoon-web/src/protocol/` | 协议层，只依赖 `fetch`，不 import 任何 DSH 包 |
+| `packages/dsh-raccoon-web/src/protocol/` | 协议层，只依赖 `fetch` 与 `node:*`（`loopback.ts` 会 `node:http` / `node:net` / `node:crypto`），不 import 任何 DSH 包 |
 | `packages/dsh-raccoon-web/src/provider/` | 适配层，可以 import `@earendil-works/pi-ai` 与 `@deepseek-ai/dsh-llm*` |
 | `packages/dsh-raccoon-web/src/host/` | 宿主半身，路由/settings/状态存储 |
 | `packages/dsh-raccoon-web/lib/client.js` | 浏览器半身，**手写**，不经 tsup |

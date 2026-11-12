@@ -285,15 +285,28 @@ body: {"qrcode_code": "<45 字符>"}
 
 `expired_at` 若存在必须是 `Number.isSafeInteger && > 0`（秒），否则按 `INVALID_RESPONSE` 处理。
 
-### 2.8 `GET /login/mp?...` 一律 404
+### 2.8 `GET /login/mp?...` 一律 404 —— **2026-11-12 起这个路由已经不存在**
 
-无论 fresh / 过期 / garbage，都返回 6490–6572 字节的 Next.js HTML 骨架，状态码 404（E-003）。
+| 请求 | UA | 结果 |
+| --- | --- | --- |
+| `GET /login/mp?code=<45字符>&appname=小浣熊官网` | 微信 iPhone / 微信 Windows / Chrome 131 / curl / 无 UA | **404 / 9723~9742 字节** `__next_error__` |
+| 同上 + `x-requested-with: com.tencent.mm` + `referer: https://servicewechat.com/` + 完整 `sec-fetch-*` | 微信 iPhone | 404 |
+| 同上 + `_rsc=1` + `accept: text/x-component` | — | **200 / 5566 字节 RSC 流**，含 `notFound:[[["$","title",null,{"children":"404: This page could not be found."}]]]` |
+| `GET /login/mp/` | — | 308 |
+| `GET /login/mp/<code>` / `GET /login/mp` | — | 404 |
+| `GET /login` | — | **200 / 44843 字节**，标题「登录账号 \| 商汤小浣熊」 |
 
-**这个页面只能被微信打开**（靠 User-Agent / 微信 JSSDK 环境判断）。
+RSC 流里的 `notFound` 是 Next.js 的 404 表示 —— **是路由不存在，不是鉴权、不是 UA 白名单、不是缺归因**。
+
+配套的 `POST /api/web/auth/v1/login_with_qrcode_code` 对**任何** body（含 `{}`、含非法 code、含 1 小时前/后的时间戳）恒定 `200 {"code":0,"message":"success","data":{"status":"pending"}}` —— **没有任何"码不存在"的信号**。
 
 → 所以：
 - 界面上**绝不能**提供"在浏览器打开登录页"的按钮
 - 也不能靠这个端点判断码是否有效
+- **Web auth 扫码（协议 B）在服务端侧已断**：用户微信扫完点确认，手机上看到「二维码已过期或已被使用」，而我们的轮询永远是 `pending`。这不是我们的 bug，补齐 UA 与 `registration_attribution` 后行为零变化。加号改走浏览器 loopback（[ADR-0012](../02-design/adr/0012-browser-loopback-login.md)，实现 `protocol/loopback.ts`）。
+- 协议 A（IAM 小程序码，`POST /api/iam/v1/auth/mp/qrcode`）走另一套命名空间，**未受影响**，仍可作备用。
+
+详见 [E-040](./05-empirical-findings.md)。
 
 ---
 
@@ -758,9 +771,9 @@ linux  → "desktop-linux"
 
 ---
 
-## 9. 官方登录的另两条路（未实现，记下备查）
+## 9. 官方登录的另三条路
 
-### 9.1 授权码深链
+### 9.1 授权码深链（不做）
 
 ```
 https://<login-host>/authorize?login_source=desktop&appname=办公小浣熊客户端
@@ -774,17 +787,43 @@ POST /api/web/auth/v1/login_with_authorization_code {code}
 
 需要注册自定义协议处理器 —— 我们做不到（插件没有那个能力），所以不实现。
 
-### 9.2 浏览器登录 + loopback 回调
+### 9.2 浏览器登录 + loopback 回调（**已实现**，见 ADR-0012）
 
-`createWebLogin`，`mode: "loopback"`，`appname` 随语言变（`webLoginResources[lang].appName`）。
+`createWebLogin`，`mode: "loopback"`，`appname` 随语言变（`webLoginResources[lang].appName` = `${enterpriseName('zh')}客户端`）。
 
-同样需要起一个本地回调服务器并让浏览器信任它。比扫码多三个失败点，不做。
+```
+GET /authorize
+    ?login_source=desktop
+    &appname=商汤小浣熊客户端
+    &desktop_callback=loopback
+    &redirect=http://127.0.0.1:<port>/auth/callback
+    &state=<32 字节 hex>
+   ↓ 用户在浏览器里正常登录（手机号 / 微信都行）
+   ↓ 浏览器 302 到 redirect
+GET http://127.0.0.1:<port>/auth/callback?code=<授权码>&state=<同一个 state>
+   ↓ 我们逐字符比对 state
+POST /api/web/auth/v1/login_with_authorization_code { authorization_code: code }
+   ↓ code === 0 且 data.access_token
+拿到 token（IAM token 不要求 refresh_token）
+```
+
+2026-11-12 实测：
+- `GET /authorize?...` → **200 / 32175 字节**，`<title>客户端授权 | 商汤小浣熊</title>`，正文「授权 商汤小浣熊客户端 / 此应用希望使用你的账号登录」。**对裸请求开放，不需要 cookie。**
+- `POST login_with_authorization_code` 对假 code 与 `{}` → **400 `{"code":200035,"message":"authorization_code_not_found_error","details":"authorization code not found"}`** —— 它真的在校验（与 `login_with_qrcode_code` 的无状态完全不同）。
+
+拒收判据（照抄官方 `webLoginLoopback.js`）：非 `/auth/callback?` 前缀 / `url.length > 8192` / 带 hash / 参数名不在 `['code','state']` / `state` 或 `code` 出现次数 ≠ 1 / `!/^[a-f0-9]{64}$/` / `timingSafeEqual` 不等 / `code.trim()` 空 / `code.length > 4096` / 含 `[\x00-\x1f\x7f]`。请求侧还要求 `GET`、`host` 相符、`remoteAddress === '127.0.0.1'`、`sec-fetch-dest` 空或 `document`。超时 300000ms。
+
+实现与单测：`src/protocol/loopback.ts` + `test/loopback.test.ts`（LB-1~LB-35）。
+
+### 9.3 桌面端凭据（默认路线，见 §1.1 / ADR-0008）
+
+**不是**登录，是"读官方客户端已经登录好的那一个文件"。它是插件默认的身份来源，扫码与 loopback 都是兜底。
 
 ---
 
-## 10. 实测覆盖状态（E-001 ~ E-039 全部收口）
+## 10. 实测覆盖状态（E-001 ~ E-040 全部收口）
 
-2026-11-11 之后**已无待补的实测项**。下面这张表是"曾经的缺口 → 现在的结果"，留着是为了下次有人怀疑某条假设时能直接跳到证据。
+2026-11-11 之后**已无待补的实测项**；2026-11-12 补了 E-040（`/login/mp` 下线）。下面这张表是"曾经的缺口 → 现在的结果"，留着是为了下次有人怀疑某条假设时能直接跳到证据。
 
 | # | 原问题 | 结论 | 证据 |
 | --- | --- | --- | --- |
@@ -794,8 +833,9 @@ POST /api/web/auth/v1/login_with_authorization_code {code}
 | **E-037** | token 刷新（body 字段名 / 版本号是否校验） | 端点存在、字段名是 `token`、格式校验猜不出；**且 refresh 会 rotate，一 rotate 就把官方客户端踢下线 → 本项目不做自动续期** | [E-037](./05-empirical-findings.md) |
 | **E-038** | `x-raccoon-session-id` 到底影响什么 / 设备身份头 | `X-Client-Device-ID` 是唯一设备身份头；带不带对 `balance` 与 `model_catalog` 都 200 且结果一致 | [E-038](./05-empirical-findings.md) |
 | **E-039** | 桌面端凭据过期后客户端怎么续（我们能否搭车） | 真实倍率看 `billing_effective_multiplier`（`billing_multiplier` 是标价）；免费模型的 `end_at` 不是判据 | [E-039](./05-empirical-findings.md) |
+| **E-040** | 微信扫完点确认，插件为什么收不到登录 | **`/login/mp` 路由已下线（恒 404）**，扫码链路在服务端侧就断了；官方换账号走 `/authorize` + 本机 loopback + `login_with_authorization_code`（假 code → 400/200035，真的在校验） | [E-040](./05-empirical-findings.md) |
 
-**唯一仍然"没验过"的不是实测项，是人工路径**：扫码登录（协议 A / 协议 B）从没被真人用手机扫过一次，号池的「扫码添加」因此也只在协议层验证过。这条记在 `docs/00-index.md` 的对齐状态段。
+**仍然"没验过"的人工路径**：扫码登录（协议 A / 协议 B）从没被真人用手机扫过一次（而且协议 B 现在服务端已断）；号池的「浏览器登录」验到了起服务、URL、三条拒收判据、假 code 走完换码端点，**但"用户在浏览器里真的登进去、回调带回真 code、换到真 token、进池"这一段没有人跑过**。这条记在 `docs/00-index.md` 的对齐状态段。
 
 ---
 
@@ -805,4 +845,5 @@ POST /api/web/auth/v1/login_with_authorization_code {code}
 - 未解问题：[06-open-questions.md](./06-open-questions.md)
 - 错误模型与文案：[05-error-model](../02-design/05-error-model.md)
 - 双协议决策：[ADR-0009](../02-design/adr/0009-web-auth-qr-protocol.md)
+- 浏览器 loopback 决策：[ADR-0012](../02-design/adr/0012-browser-loopback-login.md)
 - 凭据来源决策：[ADR-0008](../02-design/adr/0008-desktop-credential-reuse.md)

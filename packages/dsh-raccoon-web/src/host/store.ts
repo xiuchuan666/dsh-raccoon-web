@@ -50,10 +50,11 @@ export interface StoredToken {
    * - `qr`：用户在本插件里扫码换来的（我们自己落盘）。
    * - `desktop`：从官方桌面客户端的 `auth.json` 读来的（**我们不落盘**，
    *   只放内存；见 `protocol/desktop-auth.ts` 的三条边界）。
+   * - `browser`：浏览器 loopback 登录（`/authorize` → 本机回调 → 换 token）。
    *
    * 字段可选是为了让旧文件（没有这个键）继续读得出来，当作 `qr`。
    */
-  source?: "qr" | "desktop";
+  source?: "qr" | "desktop" | "browser";
 }
 
 /** 一条识图实测结论。 */
@@ -168,7 +169,9 @@ export async function readToken(): Promise<StoredToken | undefined> {
     // `source` 之前漏展开：磁盘读回来的 token 永远 `source === undefined`，
     // 于是"这份凭据是扫码来的还是桌面端来的"在读回之后就丢了。
     // 旧文件（没有这个键）继续当作 `qr` —— 与 `source` 字段注释里的约定一致。
-    ...(raw.source === "qr" || raw.source === "desktop" ? { source: raw.source } : {}),
+    ...(raw.source === "qr" || raw.source === "desktop" || raw.source === "browser"
+      ? { source: raw.source }
+      : {}),
   };
 }
 

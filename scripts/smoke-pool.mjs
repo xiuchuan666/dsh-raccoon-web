@@ -63,6 +63,8 @@ function fakeJwt(claims) {
 const TOKEN_A = fakeJwt({ sub: "pu-account-a", exp: Math.floor(Date.now() / 1000) + 86_400 });
 const TOKEN_B = fakeJwt({ sub: "pu-account-b", exp: Math.floor(Date.now() / 1000) + 172_800 });
 const TOKEN_DEAD = fakeJwt({ sub: "pu-account-dead", exp: Math.floor(Date.now() / 1000) + 3_600 });
+/** 浏览器 loopback 换出来的号（第 9 段用）。 */
+const TOKEN_C = fakeJwt({ sub: "pu-account-c", exp: Math.floor(Date.now() / 1000) + 259_200 });
 
 /** 从 `Authorization: Bearer xxx` 里认出是哪个号。 */
 function whoOf(headers) {
@@ -111,6 +113,8 @@ let grantCalls = 0;
 let killA = false;
 /** 每次签到写请求打的是哪个号。用来断言"已签的号没有白打一次写请求"。 */
 const grantWho = [];
+/** 换码端点被调了几次（浏览器 loopback 段用）。 */
+let exchangeCalls = 0;
 
 const fetchImpl = async (input, init = {}) => {
   const url = String(input);
@@ -139,9 +143,21 @@ const fetchImpl = async (input, init = {}) => {
         : [];
     return json(200, { code: 0, data: { items } });
   }
+  if (url.includes("/login_with_authorization_code")) {
+    exchangeCalls += 1;
+    const body = JSON.parse(String(init.body ?? "{}"));
+    if (body.authorization_code === "bad-code") {
+      return json(400, { code: 200035, message: "authorization_code_not_found_error" });
+    }
+    return json(200, { code: 0, message: "success", data: { access_token: TOKEN_C } });
+  }
   if (url.includes("/login/points/grant")) {
     grantCalls += 1;
     grantWho.push(who);
+    // DEAD 的凭据是坏的：签到写接口也要 401，这样才测得到"签到失败 → 测量状态"。
+    if (who === "DEAD") {
+      return json(401, { code: 200003, message: "authorization_verify_error", details: "authorization verify failed" });
+    }
     return json(200, { code: 0, message: "success", data: { granted: true, popup: null } });
   }
   return json(404, { code: 404, message: "not found" });
@@ -495,6 +511,25 @@ check(
   grantWho.join(",") === "B" || grantWho.join(",") === "B,DEAD",
   `grant 打到了: ${grantWho.join(",") || "(无)"}（共 ${grantCalls - grantsBefore} 次）`,
 );
+// 签到是用户主动发起的，它拿到的失败信号比对话中途的 `onResponse` 更可信：
+// 凭据真的废了就该在卡片上显示「凭据失效」，而不是继续被选去服务。
+const deadRow = rows.find((r) => r.id === "67ca1dec16c583c5");
+check(
+  "凭据失效的号在签到结果里是 error",
+  deadRow?.result === "error",
+  String(deadRow?.result),
+);
+const afterCheckin = await readPool();
+check(
+  "签到失败也落成测量状态（dead）",
+  afterCheckin.find((a) => a.id === "67ca1dec16c583c5")?.measure?.state === "dead",
+  afterCheckin.find((a) => a.id === "67ca1dec16c583c5")?.measure?.state,
+);
+check(
+  "签到写盘没有抹掉别的号（合并后仍 3 条）",
+  afterCheckin.length === 3,
+  `${afterCheckin.length}`,
+);
 
 console.log("\n== 8. 落盘与 token 安全 ==");
 const onDisk = await readPool();
@@ -507,14 +542,80 @@ const dump = JSON.stringify(snap);
 check("status 里没有 token 原文", dump.includes(TOKEN_A) === false && dump.includes(TOKEN_B) === false);
 check("status 里没有 deviceId 全文（只给 8 位）", dump.includes(DEVICE_A) === false && dump.includes(DEVICE_B) === false);
 
-console.log("\n== 9. pool-remove ==");
+console.log("\n== 9. 浏览器 loopback 加号（ADR-0012）==");
+const browserStart = await act("pool-add-browser");
+check("起服务成功", browserStart.ok === true, browserStart.error);
+const browserInfo = browserStart.browser ?? {};
+check("browser.active 为真", browserInfo.active === true, String(browserInfo.active));
+check(
+  "给的是 /authorize 且带 desktop_callback=loopback",
+  String(browserInfo.url).includes("/authorize?") && String(browserInfo.url).includes("desktop_callback=loopback"),
+  String(browserInfo.url).slice(0, 90),
+);
+check(
+  "redirect 指向 127.0.0.1 的回调路径",
+  String(browserInfo.url).includes(encodeURIComponent(`http://127.0.0.1:${browserInfo.port}/auth/callback`)),
+  `port=${browserInfo.port}`,
+);
+const stateC = new URL(String(browserInfo.url)).searchParams.get("state");
+check("state 是 64 位 hex", /^[a-f0-9]{64}$/u.test(String(stateC)), String(stateC).slice(0, 12));
+
+// 错 state：必须 400，且不能打换码端点。
+const exchangeBefore = exchangeCalls;
+const badState = await fetch(`http://127.0.0.1:${browserInfo.port}/auth/callback?code=x&state=${"0".repeat(64)}`);
+await badState.text();
+check("错 state → 400", badState.status === 400, `${badState.status}`);
+check("错 state 不打换码端点", exchangeCalls === exchangeBefore, `${exchangeCalls - exchangeBefore} 次`);
+
+// 换码失败：页面 502，且不入池。
+const badCode = await fetch(`http://127.0.0.1:${browserInfo.port}/auth/callback?code=bad-code&state=${stateC}`);
+const badPage = await badCode.text();
+check("换码失败 → 502", badCode.status === 502, `${badCode.status}`);
+check("失败原因写进页面", badPage.includes("authorization_code_not_found_error"), `页面长度 ${badPage.length}`);
+await new Promise((r) => setTimeout(r, 120));
+check("失败后 browser 收摊", (await status()).browser?.active === false);
+check(
+  "失败没污染号池",
+  (await status()).pool?.total === 3,
+  `${(await status()).pool?.total}`,
+);
+
+// 正常一轮：起服务 → 回调 → 换 token → 入池。
+const round2 = await act("pool-add-browser");
+const info2 = round2.browser ?? {};
+const state2 = new URL(String(info2.url)).searchParams.get("state");
+const okRes = await fetch(`http://127.0.0.1:${info2.port}/auth/callback?code=good-code&state=${state2}`);
+const okPage = await okRes.text();
+check("合法回调 → 200", okRes.status === 200, `${okRes.status}`);
+check("结果页说登录成功", okPage.includes("登录成功"), `页面长度 ${okPage.length}`);
+await new Promise((r) => setTimeout(r, 200));
+const afterBrowser = await status();
+check("browser 收摊并给出成功提示", afterBrowser.browser?.active === false && String(afterBrowser.browser?.message).includes("已加入账号池"), String(afterBrowser.browser?.message));
+check("池里多了一个号（3 → 4）", afterBrowser.pool?.total === 4, `${afterBrowser.pool?.total}`);
+const newOne = (afterBrowser.pool?.accounts ?? []).find((a) => a.id === poolAccountId("pu-account-c"));
+check("新号 source 是 browser", newOne?.source === "browser", String(newOne?.source));
+check("新号默认未启用", newOne?.enabled === false, `enabled=${String(newOne?.enabled)}`);
+check("新号有独立设备标识（8 位 hex）", /^[0-9a-f]{8}$/u.test(String(newOne?.device)), String(newOne?.device));
+check("新号没被拿去发请求（active 为假）", newOne?.active === false, `active=${String(newOne?.active)}`);
+
+// 取消：起服务再取消，必须收摊且不入池。
+const round3 = await act("pool-add-browser");
+const cancel = await act("pool-add-browser-cancel");
+check("取消成功", cancel.ok === true, cancel.error);
+check("取消后 browser 收摊", cancel.browser?.active === false);
+check("取消后池不变", (await status()).pool?.total === 4, `${(await status()).pool?.total}`);
+const cancelAgain = await act("pool-add-browser-cancel");
+check("重复取消 → ok:false", cancelAgain.ok === false, cancelAgain.error);
+void round3;
+
+console.log("\n== 10. pool-remove ==");
 const removed = await act("pool-remove", { id: "67ca1dec16c583c5" });
 check("移除成功", removed.ok === true, removed.error);
-check("剩 2 个", poolOf(removed)?.total === 2, `${poolOf(removed)?.total}`);
+check("剩 3 个", poolOf(removed)?.total === 3, `${poolOf(removed)?.total}`);
 const missing = await act("pool-remove", { id: "nope" });
 check("移除不存在的 id → ok:false", missing.ok === false, missing.error);
 
-console.log("\n== 10. 卸载 ==");
+console.log("\n== 11. 卸载 ==");
 host.dispose();
 check("全部 registration 都已注销", registered.every((r) => r.disposed), `${registered.length} 个`);
 

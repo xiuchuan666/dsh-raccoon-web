@@ -358,9 +358,45 @@ curl.exe -s -X POST "http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/action?acti
 
 ## 6. 扫码相关
 
+> **先读这一条（2026-11-12，E-040）**：`https://xiaohuanxiong.com/login/mp?code=...` 这个页面**在服务端已经不存在了**，任何 UA / header 组合都是 404（Next.js 的 `notFound`，`_rsc=1` 时能在 RSC 流里看到 `404: This page could not be found.`）。而 `POST /api/web/auth/v1/login_with_qrcode_code` 对**任何** body 都恒回 `{"code":0,"data":{"status":"pending"}}`，没有任何失败信号。
+>
+> 所以 `qrProtocol: "web"`（协议 B，也就是「官方客户端同款」那种码）**现在无论怎么扫都不会成功** —— 微信扫出来只会看到「二维码已过期或已被使用」。这不是编码器坏了，也不是 code 格式错了。
+>
+> **加号主路线已改成浏览器 loopback**（ADR-0012）：点「账号池 → 浏览器登录」，会打开 `https://xiaohuanxiong.com/authorize?...&desktop_callback=loopback&redirect=http://127.0.0.1:<port>/auth/callback`，用户在浏览器里登录完，本机回调服务拿到 `code`，再用 `POST /api/web/auth/v1/login_with_authorization_code` 换成 token。这条路是官方桌面端换账号时走的同一条。
+>
+> 扫码这条**不删**：`qrProtocol: "iam"` 是另一套命名空间（`appname=商汤小浣熊`、`code` 形如 `qr-...`），不受 `/login/mp` 下线影响，是唯一还能被微信小程序认的。
+
+### 6.0 「账号池加号没反应 / 一直等」
+
+| 检查 | 怎么查 | 结论 |
+| --- | --- | --- |
+| `status.browser.active` | `curl -s "http://127.0.0.1:<PORT>/plugins/dsh-raccoon-web/status"` | `true` = 回调服务在听；`false` 看 `browser.message` |
+| `browser.message` | 同上 | 成功 / 超时 / `authorization_code_not_found_error` 都在这里 |
+| `browser.url` | 同上 | 是 `/authorize?...` 就对了；换了域说明上游改了 |
+| `browser.port` | 同上 | 一次性随机端口；`GET http://127.0.0.1:<port>/other` 应回 400 |
+| `login.lastPoll` | 只在 `phase` 是 `pending`/`logging` 时出现 | 扫码那条路的证据；恒 `pending` = 服务端没认领 |
+
+**「浏览器登录」的三条护栏**（都实测过，被拒就是对的）：
+
+- `state` 不匹配 → 400，且**不会**去打换码端点；
+- 路径不是 `/auth/callback` → 400；
+- 回调只接受一次（第二次连接被拒），5 分钟没完成就 `expired`。
+
+排障时可以直接手动验证换码端点（假 code 应当拿到 200035）：
+
+```powershell
+curl.exe -s -X POST "https://xiaohuanxiong.com/api/web/auth/v1/login_with_authorization_code" -H "content-type: application/json" -d '{"authorization_code":"fake-code"}'
+# 期望：{"code":200035,"message":"authorization_code_not_found_error", ...}
+```
+
+拿到 200035 说明端点活着、也说明我们打到的是对的地方；拿到别的（尤其 404）说明上游又改了。
+
 ### 6.1 「二维码已过期或已被使用」（手机扫出来就这句）
 
-**先看操作顺序**。这是项目早期踩过的坑（E-029）：
+**先分清是"服务端下线"还是"操作顺序错了"**：
+
+- 如果 `settings.qrProtocol` 是 `web` → **这就是 E-040，扫一百次也不会成功**，改用「浏览器登录」。
+- 如果是 `iam` → 才往下看操作顺序。这是项目早期踩过的坑（E-029）：
 
 - `LoginFlow.start()` 的实现是**先 `cancel()` 再取新码** → 新码生成的一瞬间，旧码在服务端就作废了
 - 所以**贴给用户一张码之后，不能再跑任何会触发 `login-start` 的命令**（包括旧版 `login-qr.mjs` 的默认行为）
@@ -375,14 +411,18 @@ node scripts/login-qr.mjs --wait-only   # 后台盯状态，绝不换码
 
 在界面里也一样：点了「扫码登录」拿到码之后，**不要重复点**。
 
+> 另外：`canceled` 现在**不是结束，是换码**（官方网页端 `if("canceled"===r) return void c();`）。`LoginFlow` 会自动换一张并提示「二维码已刷新，请重新扫码。」，最多换 3 次（`MAX_REISSUES`），超了收尾成「二维码反复失效，请重新获取。」
+
 ### 6.2 手机确认了但一直 `pending`
 
 | 检查 | 现象 | 解决 |
 | --- | --- | --- |
-| `settings.qrProtocol` 是 `web` 还是 `iam` | 两种码**互不通用** | 微信小程序只认 `iam`；官方客户端同款是 `web` |
-| `web` 协议下 code 是本地生成的 45 字符 | 正常 | `pollWebSession` 对任何合法 code 都回 `pending`，**没有失败信号**，只能等用户确认 |
+| `settings.qrProtocol` 是 `web` 还是 `iam` | 两种码**互不通用** | **`web` 现在必然失败**（E-040，`/login/mp` 已 404）；能用的是 `iam` |
+| `login.lastPoll` | 一直是 `pending` | 服务端没认领这张码 —— `web` 协议下这是必然的，别再等 |
 | 状态卡在 `logging` | 用户扫了但没在手机上点确认 | 等；`logging` 与 `pending` 文案不同 |
-| 一直 `expired` | 5 分钟到了 | 重新 `--new` 一张 |
+| 一直 `expired` | 5 分钟到了 | 重新 `--new` 一张，或改用「浏览器登录」 |
+
+`lastPoll` 取值：`pending` / `logging` / `canceled` / `error:<原文>`；后两种只在那一轮还没结束时出现。**排障第一眼看它** —— 没有这个字段时只能靠猜（2026-11-12 为此白跑过一轮取证）。
 
 切协议：
 
@@ -410,6 +450,8 @@ node --experimental-strip-types --import ./scripts/ts-resolve-register.mjs scrip
 - `appname=`（`web` 是 `小浣熊官网`，`iam` 是 `商汤小浣熊`）
 
 两个都不对说明编码器坏了；只有一个不对说明是协议选错。
+
+**别再怀疑 `web-auth.ts` 的 `CODE_RE`**：`/^\d{13}[a-f0-9]{32}$/` 只有一个反斜杠，2026-11-11 与 11-12 两次用码点逐字符验证过（`codes` 里 `92,100` 就是 `\` + `d`），`lib/index.js` 里也一样。这个正则已经被冤枉过两次了。
 
 ---
 
@@ -568,7 +610,7 @@ ctx.effect(() => ..., "label")                     // 旧式写法（三个参�
 
 ```
 插件: dsh-raccoon-web 0.1.0
-build: 2026-11-11T23:05
+build: 2026-11-12T01:20
 平台: win32 / node v24.21.0
 登录: ready (access_token)
 来源: 官方客户端凭据
